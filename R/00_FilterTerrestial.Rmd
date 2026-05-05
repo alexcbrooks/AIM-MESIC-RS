@@ -1,0 +1,57 @@
+---
+title: "00_FilterTerrestial"
+output: html_document
+date: "2026-05-05"
+editor_options: 
+  chunk_output_type: console
+---
+
+# Setup
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(sf)
+
+dat_path <- '/Users/alexbrooks/Library/CloudStorage/OneDrive-DesertResearchInstitute/Projects/Analysis/BLM/AIM_RW/'
+
+terrADat <- st_read(paste0(dat_path, 'dataIn/AIM Terrestial/BLM_Natl_AIM_TerrADat_Hub_-5035550044989121283.gpkg'))
+```
+
+# Filter
+```{r}
+
+vbet_filt <-  list.files(paste0(dat_path,'dataIn/AIM Terrestial/mesic_intersections'), full.names = TRUE, pattern = 'VBET') %>%
+  purrr::map_df(readr::read_csv) %>% 
+  rename(vbet_value = value) %>% 
+  distinct()
+
+nwi_filt <-  list.files(paste0(dat_path,'dataIn/AIM Terrestial/mesic_intersections'), full.names = TRUE, pattern = 'NWI') %>%
+  purrr::map_df(readr::read_csv) %>% 
+  rename(nwi_value = value)%>% 
+  distinct()
+
+mesic_filter <- vbet_filt %>% 
+  left_join(nwi_filt)
+
+
+terrADat_w_mesicflag <- terrADat %>% 
+  dplyr::select(PrimaryKey) %>% 
+  left_join(mesic_filter) %>% 
+  mutate(mesic = ifelse(vbet_value==0 & nwi_value==0, FALSE, TRUE))
+
+n_tally<- terrADat_w_mesicflag %>% group_by(vbet_value, nwi_value) %>% tally()
+
+terrADat$PrimaryKey %>% unique(.) %>% length()
+
+terrADat_mesic <- terrADat_w_mesicflag %>% 
+  filter(mesic==TRUE)
+
+terrADat_mesic %>% st_write(paste0(dat_path, 'dataIn/AIM Terrestial/BLM_Natl_AIM_TerrADat_Hub_-5035550044989121283_mesic.gpkg'))
+
+terrADat_mesic %>% 
+  st_transform(crs=5070) %>% 
+  st_buffer(30)  %>% 
+  st_write(paste0(dat_path, 'dataIn/AIM Terrestial/BLM_Natl_AIM_TerrADat_Hub_-5035550044989121283_mesic_spoke_polygons.gpkg'))
+  
+```
+
