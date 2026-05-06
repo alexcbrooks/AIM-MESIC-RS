@@ -1,0 +1,155 @@
+---
+title: "01_CHM_Analysis"
+output: html_document
+date: "2026-05-05"
+editor_options: 
+  chunk_output_type: console
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(sf)
+library(ggthemes)
+dat_path <- '/Users/alexbrooks/Library/CloudStorage/OneDrive-DesertResearchInstitute/Projects/Analysis/BLM/AIM_RW/'
+```
+
+
+
+```{r}
+# ---------------------------------------------------------------------------
+# Aggregate per-polygon CHM histogram bins into coarser height classes
+# and compute proportion of polygon area in each class.
+#
+# Input: CSV exported from GEE with columns:
+#   PlotID, mean, median, count, bin_0p0_0p5, bin_0p5_1p0, ..., bin_29p5_30p0
+#
+# Output: data frame with PlotID, mean, median, count, and proportion of
+# polygon area in each of: 0-0.5, 0.5-1, 1-3, 3-5, 5-10, >10 m
+# ---------------------------------------------------------------------------
+
+library(dplyr)
+library(readr)
+library(tidyr)
+
+# ---- Inputs ---------------------------------------------------------------
+input_csv  <- paste0(dat_path,'dataIn/RS_Data/aim_rw_chm_stats_V3_NV.csv')   # adjust path as needed
+output_csv <- "aim_rw_chm_classes_NV.csv"
+
+# ---- Read -----------------------------------------------------------------
+df <- read_csv(input_csv)
+
+# ---- Define height classes ------------------------------------------------
+# Each class lists the 0.5 m bin column names that compose it.
+# Bins are labeled by their LEFT edge: bin_1p0_1p5 = pixels with height in [1.0, 1.5).
+# So class "1-3 m" = bins with left edges 1.0, 1.5, 2.0, 2.5.
+
+bin_name <- function(left_edge) {
+  right_edge <- left_edge + 0.5
+  sprintf("bin_%s_%s",
+          gsub("\\.", "p", sprintf("%.1f", left_edge)),
+          gsub("\\.", "p", sprintf("%.1f", right_edge)))
+}
+
+class_definitions <- list(
+  "prop_0_0p1"  = bin_name(seq(0.0,  0.0,  by = 0.1)),  # just 0-0.5
+  "prop_0_0p25"  = bin_name(seq(0.0,  0.0,  by = 0.25)),  # just 0-0.5
+  "prop_0_0p5"  = bin_name(seq(0.0,  0.0,  by = 0.5)),  # just 0-0.5
+  "prop_0p5_1"  = bin_name(seq(0.5,  0.5,  by = 0.5)),  # just 0.5-1
+  "prop_0.5_3"    = bin_name(seq(0.5,  2.5,  by = 0.5)),  # 1.0, 1.5, 2.0, 2.5
+  "prop_0.5_5"    = bin_name(seq(0.5,  4.5,  by = 0.5)),  # 1.0, 1.5, 2.0, 2.5
+  "prop_0.5_30"    = bin_name(seq(0.5,  29.5,  by = 0.5)),  # 1.0, 1.5, 2.0, 2.5
+  "prop_1_3"    = bin_name(seq(1.0,  2.5,  by = 0.5)),  # 1.0, 1.5, 2.0, 2.5
+  "prop_1_5"    = bin_name(seq(1.0,  4.5,  by = 0.5)),  # 1.0, 1.5, 2.0, 2.5
+  "prop_1_30"    = bin_name(seq(1.0,  29.5,  by = 0.5)),  # 1.0, 1.5, 2.0, 2.5
+  "prop_3_30"    = bin_name(seq(3.0,  29.5,  by = 0.5)),  # 3.0, 3.5, 4.0, 4.5
+  "prop_5_30"   = bin_name(seq(5.0,  29.5,  by = 0.5)),  # 5.0, 5.5, ..., 9.5
+  "prop_gt10"   = bin_name(seq(10.0, 29.5, by = 0.5))   # 10.0 through 29.5
+)
+
+# ---- Build the aggregated data frame --------------------------------------
+# For each class, sum the relevant bin columns row-wise, then divide by count.
+
+result <- df %>%
+  dplyr::select(Evaluation, mean, median, count)
+
+for (class_name in names(class_definitions)) {
+  bin_cols <- class_definitions[[class_name]]
+
+  # Defensive: warn if any expected bin column is missing
+  missing_cols <- setdiff(bin_cols, names(df))
+  if (length(missing_cols) > 0) {
+    warning(sprintf("Missing bin columns for %s: %s",
+                    class_name, paste(missing_cols, collapse = ", ")))
+    bin_cols <- intersect(bin_cols, names(df))
+  }
+
+  # Row-wise sum of bin counts in this class, divided by total pixel count.
+  # Safe-divide: returns NA if count is 0 or NA.
+  class_count <- rowSums(df[, bin_cols, drop = FALSE], na.rm = TRUE)
+  result[[class_name]] <- ifelse(
+    is.na(df$count) | df$count == 0,
+    NA_real_,
+    class_count / df$count
+  )
+}
+
+# ---- Sanity check: proportions should sum to ~1 ---------------------------
+prop_cols <- names(class_definitions)
+result$prop_sum_check <- rowSums(result[, prop_cols], na.rm = TRUE)
+
+# Flag any rows where the sum deviates meaningfully from 1.
+# (Small deviations are expected if any pixels exceed 30 m and fell outside
+# the histogram range, but those should be rare in NV riparian.)
+off_rows <- which(abs(result$prop_sum_check - 1) > 0.01 &
+                    !is.na(result$prop_sum_check))
+if (length(off_rows) > 0) {
+  message(sprintf(
+    "Note: %d polygons have proportions that don't sum to 1 (likely pixels >30 m or count issues).",
+    length(off_rows)
+  ))
+}
+
+# ---- Write ----------------------------------------------------------------
+write_csv(result, output_csv)
+message("Wrote: ", output_csv)
+print(head(result))
+
+```
+
+# Load AIM Indicators and join
+
+```{r setup, include=FALSE}
+result
+indicators_all <-  readRDS(paste0(dat_path,'/scratch/collated_field_indicators/aim_selected_indicators_wide.RDS')) %>% 
+  filter(EvaluationID != ('CA-APFO-TW-24036_2024-08-30'))
+
+rs_wide_all <- readRDS(paste0(dat_path,'scratch/rs_data_yearofsampling_wide.RDS'))%>% 
+  filter(EvaluationID != ('CA-APFO-TW-24036_2024-08-30')) 
+
+rw_plots <- readRDS(paste0(dat_path,'scratch/rw_plots.RDS')) %>% filter(EvaluationID != ('CA-APFO-TW-24036_2024-08-30'))
+
+ind_chm<- indicators_all %>% inner_join(result %>% dplyr::select(EvaluationID=Evaluation, chm_mean = mean, chm_median = median,prop_0_0p5:prop_gt10)) %>% 
+  left_join(rs_wide_all) %>% 
+  left_join(rw_plots) %>% 
+  filter(AvgWidthArea_1>10)
+
+ind_chm %>% 
+  pivot_longer(chm_mean:prop_gt10) %>% 
+  ggplot(aes(value,FH_HERB))+
+  geom_point()+
+  geom_smooth(method='lm',se=FALSE)+geom_smooth(color='red',se=FALSE)+ggpubr::stat_cor()+facet_wrap(~name,scales='free_x')+
+  coord_cartesian(ylim=c(0,100))
+
+
+ind_chm %>% ggplot(aes(WetlandType, chm_mean))+geom_boxplot()
+ind_chm %>% ggplot(aes(chm_mean,FH_WoodyCover))+geom_point()+geom_smooth(method='lm')+geom_smooth(color='red',se=FALSE)+ggpubr::stat_cor()
+ind_chm %>% ggplot(aes(chm_median,FH_WoodyCover))+geom_point()+geom_smooth(method='lm')+geom_smooth(color='red',se=FALSE)+ggpubr::stat_cor()
+ind_chm %>% ggplot(aes(chm_mean,s2_jas_ndvi_median_mean, fill=FH_WoodyCover))+
+  geom_point(shape=21,size=3)+
+  scale_fill_viridis_c()
+
+lm(data=ind_chm, FH_ShrubCover~chm_mean*s2_jas_ndvi_median_mean+chm_mean*s2_amj_ndvi_median_mean) %>% summary(.)
+```
+
