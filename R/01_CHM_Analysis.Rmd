@@ -137,7 +137,7 @@ ind_chm<- indicators_all %>% inner_join(result %>% dplyr::select(EvaluationID=Ev
 
 ind_chm %>% 
   pivot_longer(chm_mean:prop_gt10) %>% 
-  ggplot(aes(value,FH_HERB))+
+  ggplot(aes(value,FH_WoodyCover))+
   geom_point()+
   geom_smooth(method='lm',se=FALSE)+geom_smooth(color='red',se=FALSE)+ggpubr::stat_cor()+facet_wrap(~name,scales='free_x')+
   coord_cartesian(ylim=c(0,100))

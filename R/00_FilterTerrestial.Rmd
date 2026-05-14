@@ -55,3 +55,9 @@ terrADat_mesic %>%
   
 ```
 
+```{r}
+terrADat_mesic <- st_read(paste0(dat_path, 'dataIn/AIM Terrestial/BLM_Natl_AIM_TerrADat_Hub_-5035550044989121283_mesic.gpkg'))
+
+
+```
+
