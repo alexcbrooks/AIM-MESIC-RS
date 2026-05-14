@@ -17,18 +17,18 @@ EE_PROJECT = "dri-blm"
 # -----------------------------------------------------------------------------
 # Points asset (western US, ~1000 features). Must have EvltnID.
 # HUC4 is attached at load time via spatial join in driver.py.
-POINTS_ASSET = "projects/dri-blm/assets/aim_rw_points"
+POINTS_ASSET = 'projects/dri-apps/assets/blm-riparian/aim_rw_plot_center_all_2022_2024'
 
 # Polygons asset (Nevada AIM-RW footprints, ~350 features). Must have EvltnID.
 # HUC6 is attached at load time.
-POLYGONS_ASSET = "projects/dri-blm/assets/aim_rw_polygons_NV"
+POLYGONS_ASSET = 'projects/dri-apps/assets/blm-riparian/aim-rw-footprints-V3-NV_20250425'
 
 # Local source files (used by prep_features.py if you upload via the CLI flow)
 LOCAL_POINTS_PATH = "PATH_TO_LOCAL_POINTS_FILE"
 LOCAL_POLYGONS_PATH = "PATH_TO_LOCAL_POLYGONS_FILE"
 
 # ID column on input features (preserved into all outputs)
-ID_COLUMN = "EvltnID"
+ID_COLUMN = "Evaluation"
 
 # -----------------------------------------------------------------------------
 # HUC layers (USGS Watershed Boundary Dataset, hosted in EE)
@@ -52,7 +52,7 @@ S2_END_YEAR = 2025
 RAP_START_YEAR = 1986
 RAP_END_YEAR = 2025
 
-GRIDMET_START_YEAR = 1984
+GRIDMET_START_YEAR = 1980
 GRIDMET_END_YEAR = 2025
 
 MRRMAID_START_YEAR = 2019

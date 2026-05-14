@@ -248,8 +248,8 @@ def water_year_pr(pr_collection, year):
 def water_year_spei(spei_collection, year):
     """Mean SPEI1y over Sep 20 - Sep 30 of the given year (end of water year)."""
     year_str = ee.Number(year).format("%.0f")
-    start = year_str.cat("-09-20")
-    end = year_str.cat("-09-30")
+    start = year_str.cat("-09-27")
+    end = year_str.cat("-10-04")
     return (spei_collection.filterDate(start, end)
             .mean()
             .rename("spei1y_eow")
