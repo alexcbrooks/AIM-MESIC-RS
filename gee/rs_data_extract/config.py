@@ -28,7 +28,7 @@ LOCAL_POINTS_PATH = "PATH_TO_LOCAL_POINTS_FILE"
 LOCAL_POLYGONS_PATH = "PATH_TO_LOCAL_POLYGONS_FILE"
 
 # ID column on input features (preserved into all outputs)
-ID_COLUMN = "Evaluation"
+ID_COLUMN = "EvltnID"
 
 # -----------------------------------------------------------------------------
 # HUC layers (USGS Watershed Boundary Dataset, hosted in EE)
@@ -104,7 +104,7 @@ POLYGONS_MAX_BATCH = 100
 # -----------------------------------------------------------------------------
 # Run flags (toggle in driver.py — these are defaults)
 # -----------------------------------------------------------------------------
-RUN_S2_INDICES = True       # Block 1: S2 NDVI, NDWI_NS, NDWI_GS bimonthly
+RUN_S2_INDICES = False       # Block 1: S2 NDVI, NDWI_NS, NDWI_GS bimonthly
 RUN_S2_ALT_VIS = True       # Block 2: S2 EVI, MSAVI, MCARI2, FCVI, VSDI bimonthly
 RUN_S2_THRESHOLDS = True    # Block 3: NDVI proportion-above-threshold
 RUN_RAP_NDVI_SHORT = True   # Block 4: RAP NDVI short window (matches S2 years)
