@@ -343,27 +343,27 @@ def run_long_ts(features, feature_label,
         submit_export(rap_table, f"long_rap_ndvi_{feature_label}_{batch_label}",
                       selectors=rap_selectors)
 
-        # PR
+        # PR — single-band image: reduceRegions(mean()) outputs "mean", not band name
         def _reduce_pr(img):
             year = ee.Number.parse(img.get("year"))
             return img.reduceRegions(
                 collection=batch_fc.select([id_col, huc_col]),
                 reducer=ee.Reducer.mean(),
                 scale=config.GRIDMET_SCALE,
-            ).map(lambda f: f.set("year", year))
+            ).map(lambda f: f.set("year", year).set("pr_wy_sum", f.get("mean")))
 
         pr_table = pr_annual.map(_reduce_pr).flatten()
         submit_export(pr_table, f"long_pr_wy_{feature_label}_{batch_label}",
                       selectors=pr_selectors)
 
-        # SPEI
+        # SPEI — same single-band naming issue; rename "mean" → "spei1y_eow"
         def _reduce_spei(img):
             year = ee.Number.parse(img.get("year"))
             return img.reduceRegions(
                 collection=batch_fc.select([id_col, huc_col]),
                 reducer=ee.Reducer.mean(),
                 scale=config.GRIDMET_SCALE,
-            ).map(lambda f: f.set("year", year))
+            ).map(lambda f: f.set("year", year).set("spei1y_eow", f.get("mean")))
 
         spei_table = spei_annual.map(_reduce_spei).flatten()
         submit_export(spei_table, f"long_spei1y_{feature_label}_{batch_label}",

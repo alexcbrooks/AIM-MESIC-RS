@@ -112,11 +112,11 @@ POLYGONS_MAX_BATCH = 100
 RUN_POINTS = True
 RUN_POLYGONS = True
 
-RUN_S2_INDICES = True       # Block 1: S2 NDVI, NDWI_NS, NDWI_GS bimonthly
-RUN_S2_ALT_VIS = True       # Block 2: S2 EVI, MSAVI, MCARI2, FCVI, VSDI bimonthly
-RUN_S2_THRESHOLDS = True    # Block 3: NDVI proportion-above-threshold
+RUN_S2_INDICES = False       # Block 1: S2 NDVI, NDWI_NS, NDWI_GS bimonthly
+RUN_S2_ALT_VIS = False       # Block 2: S2 EVI, MSAVI, MCARI2, FCVI, VSDI bimonthly
+RUN_S2_THRESHOLDS = False    # Block 3: NDVI proportion-above-threshold
 RUN_LONG_TS = True          # Block 5: RAP NDVI + GRIDMET PR + SPEI long TS
-RUN_MRRMAID = True          # Block 6: MRRMAID class proportions
+RUN_MRRMAID = False          # Block 6: MRRMAID class proportions
 
 # Which feature class each block uses
 #   "points"   -> POINTS_ASSET

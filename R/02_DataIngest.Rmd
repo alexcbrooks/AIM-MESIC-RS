@@ -1,0 +1,5004 @@
+---
+title: "R Notebook"
+output: html_notebook
+editor_options: 
+  chunk_output_type: console
+---
+
+##  Analysis Notes
+
+CA-APFO-TW-24036_2024-08-30 polygon appears to in the wrong location. Removing from analysis for now.  
+5/22/26 Ingesting 2022-2024 point data from all AIM RW locations
+
+
+# Setup 
+
+```{r setup}
+library(sf)
+library(mapview)
+library(tidyverse)
+library(ggthemes)
+library(patchwork)
+library(ggpubr)
+library(ggcorrplot)
+library(corrplot)
+library(ggh4x)
+library(segmented)
+library(pROC)
+
+combine_files <- function(folder_path, pattern) {
+  matching_files <- list.files(
+    path = folder_path,
+    pattern = pattern,
+    full.names = TRUE
+  )
+  
+  combined_data <- matching_files %>%
+    map_dfr(~ read_csv(.x, col_types = cols(huc4 = col_character()), show_col_types = FALSE))
+  
+  return(combined_data)
+}
+
+dat_path <- '/Users/alexbrooks/Library/CloudStorage/OneDrive-DesertResearchInstitute/Projects/Analysis/BLM/AIM_RW/'
+
+```
+
+# Ingest Remote Sensing
+
+## Point Data
+
+```{r}
+s2_indices<- combine_files(folder_path = paste0(dat_path,'dataIn/RS_Data/'),pattern='s2_idx_alt_points') %>% 
+    dplyr::rename_with(
+    ~ .x %>%
+        stringr::str_replace("_ndwi_ns$", "_ndmi") %>%
+        stringr::str_replace("_ndwi_gs$", "_mndwi")
+  ) %>% 
+  dplyr::select(EvaluationID=EvltnID, year, ma_ndvi:so_vsdi) %>% 
+  pivot_longer(ma_ndvi:so_vsdi, values_to = 'rs_value') %>% 
+  mutate(
+    footprint = 'plot center',
+    spatial_reducer = 'point',
+    satellite ='S2',
+    temporal_reducer = 'mean'
+  ) %>% 
+  separate(name, into=c('season','rs_index')) %>% 
+  mutate(season = factor(season, levels=c('ma','mj','ja','so'), labels=c("Mar-Apr",'May-Jun','Jul-Aug','Sep-Oct')))
+
+s2_poly_indices<- combine_files(folder_path = paste0(dat_path,'dataIn/RS_Data/'),pattern='s2_idx_alt_thr_polygons') %>% 
+    dplyr::rename_with(
+    ~ .x %>%
+        stringr::str_replace("_ndwi_ns$", "_ndmi") %>%
+        stringr::str_replace("_ndwi_gs$", "_mndwi")
+  ) %>% 
+  dplyr::select(EvaluationID=Evaluation, year, ma_ndvi:so_vsdi) %>% 
+  pivot_longer(ma_ndvi:so_vsdi, values_to = 'rs_value') %>% 
+  mutate(
+    footprint = 'plot polygon',
+    spatial_reducer = 'median',
+    satellite ='S2',
+    temporal_reducer = 'mean'
+  ) %>% 
+  separate(name, into=c('season','rs_index')) %>% 
+  mutate(season = factor(season, levels=c('ma','mj','ja','so'), labels=c("Mar-Apr",'May-Jun','Jul-Aug','Sep-Oct')))
+
+s2_poly_pctarea<- combine_files(folder_path = paste0(dat_path,'dataIn/RS_Data/'),pattern='s2_idx_alt_thr_polygons') %>% 
+  dplyr::select(EvaluationID=Evaluation, year, ma_ndvi_gt_0_1:so_ndvi_gt_0_4) %>% 
+  pivot_longer(ma_ndvi_gt_0_1:so_ndvi_gt_0_4, values_to = 'rs_value') %>% 
+  mutate(
+    footprint = 'plot polygon',
+    spatial_reducer = 'pctarea',
+    satellite ='S2',
+    temporal_reducer = 'mean'
+  ) %>% 
+  mutate(
+    t = case_when(
+      str_detect(name, '0_1') ~ '0.1',
+      str_detect(name, '0_2') ~ '0.2',
+      str_detect(name, '0_3') ~ '0.3',
+      str_detect(name, '0_4') ~ '0.4'
+    ),
+    spatial_reducer= paste0(spatial_reducer, '-',t)
+  ) %>% 
+  separate(name, into=c('season','rs_index',NA,NA)) %>% 
+  mutate(season = factor(season, levels=c('ma','mj','ja','so'), labels=c("Mar-Apr",'May-Jun','Jul-Aug','Sep-Oct'))) %>% 
+  dplyr::select(-t)
+
+mrrmaid_indices<- combine_files(folder_path = paste0(dat_path,'dataIn/RS_Data/'),pattern='mrrmaid') %>% 
+  dplyr::select(EvaluationID=Evaluation, year, month, prop_class_1:prop_class_5) %>% 
+  pivot_longer(prop_class_1:prop_class_5, values_to = 'rs_value') %>% 
+  mutate(
+    footprint = 'plot polygon',
+    spatial_reducer = 'pctarea',
+    satellite ='S2',
+    temporal_reducer = 'monthly'
+  ) %>% 
+  separate(name, into=c(NA,NA,'class_val')) %>% 
+  mutate(
+    class_name = 
+      case_when(
+       class_val =='1' ~ 'Upland',
+       class_val =='2' ~ 'Mesic',
+       class_val =='3' ~'Water',
+       class_val =='4' ~ 'Snow',
+       class_val == '5' ~ 'Shadow'
+      ),
+    month_abbr = case_when(
+      month == 6 ~ 'Jun',
+      month == 7 ~ 'Jul',
+      month == 8 ~ 'Aug',
+      month == 9 ~ 'Sep'
+    ),
+    rs_metric =  paste0('mrrmaid-',class_name,'-',month_abbr)
+  ) %>% 
+  dplyr::select(-class_name,-class_val,-month, -month_abbr)
+
+#rs_metrics <- s2_indices
+```
+
+
+
+## Ingest AIM RW
+
+```{r}
+
+# Indicator Table
+# gdb_indicators_raw <- st_read(paste0(dat_path,'dataIn/AIM RW/AIM_RW_Indicators_20250211.gpkg')) %>% 
+#   st_drop_geometry() %>% as_tibble()
+
+gdb_indicators_raw <- st_read(paste0(dat_path,'dataIn/AIM RW/AIM_RW_Indicator_2022_2024.gpkg')) %>% 
+  st_drop_geometry() %>% as_tibble()
+
+# Additional FH indicators
+fh_indicators <- read_csv(paste0(dat_path,'dataIn/AIM RW/RWAIM_FirstHitMetrics_2022-2024.csv'))
+
+# Some indicators values may not be the same between the GDB and the FH. Need to check this more. 
+# For now I'm removing all column headers from FH dataset that are also in gdb indicators
+
+indicators_raw <- gdb_indicators_raw %>% 
+  left_join(
+    fh_indicators %>% 
+      dplyr::select(-FH_TotalLitterThatchCover,-FH_MossCover,-FH_AlgaeCover,-FH_LichenCover,-FH_RockCover,
+                   -FH_SaltCrustCover,-FH_WaterCover,-FieldEvalDate,-SpeciesState,-AdminState,-SiteName,-PlotID)
+  ) %>% 
+  mutate(
+      FH_PFG = FH_PerennialCover-FH_WoodyCover,
+      FH_HERB = FH_PFG + FH_AnnualCover
+      ) %>% 
+  filter(!VisitType %in% c('AK Full Sample Visit', 'Annual Use Visit')) # remove non-standard visits 
+
+indicators_raw %>% saveRDS(paste0(dat_path,'scratch/field_indicators/aim_all_indicators_wide.RDS'))
+
+plot_char<- st_read(paste0(dat_path,'dataIn/AIM RW/plot_characterization_2022_2024.gpkg')) %>% 
+  st_drop_geometry() %>% 
+  dplyr::select(EvaluationID,WetlandIndicatorRegion,AvgWidthArea, Slope,Aspect,WetlandTypeConfidence)
+
+
+
+# Define column name groups
+metadata <- c('EvaluationID','PlotID','SamplingApproach','PlotLayout','AdminState','StateCode','FieldEvalDate',
+              'Elevation_m','PlotArea_m2','LatitudeWGS84','LongitudeWGS84')
+
+classification <- c("WetlandType",'HGMClass','CowardinAttribute')
+
+condition_indicators <- c('TotalFoliarCover','LPI_SiteWetlandValue_CWM','LPI_SiteWetlandRating_CWM','AH_HydroNoFACCover','AH_HydroWithFACCover','BareSoilCover')
+
+cover_indicators <- c('FH_WoodyCover','FH_PFG','FH_HERB','FH_AnnualCover','FH_TreeCover','FH_ShrubCover')
+
+avg_width_all_plots <- plot_char %>% 
+  st_drop_geometry() %>% 
+  dplyr::select(EvaluationID,AvgWidthArea)
+
+indicators_cln <- indicators_raw %>% 
+  dplyr::select(all_of(c(metadata,classification,condition_indicators,cover_indicators))) %>% 
+  mutate(
+    PlotLayout = factor(PlotLayout, levels=c('Linear','Mixed Layout','Diagonal','Transverse','Spoke'))
+  ) %>% 
+  left_join(plot_char)
+
+indicators_cln %>% saveRDS(paste0(dat_path,'scratch/field_indicators/aim_selected_indicators_wide.RDS'))
+```
+
+
+```{r}
+# filter rs metric to year of sampling
+rs_metrics_sel_year<- indicators_cln %>% dplyr::select(EvaluationID,FieldEvalDate ) %>% 
+  mutate(year = year(FieldEvalDate)) %>% 
+  dplyr::select(-FieldEvalDate) %>% 
+  left_join(rs_metrics)
+
+analysis_dat <- rs_metrics_sel_year %>% 
+  left_join(indicators_cln) 
+
+analysis_dat %>% 
+  filter(rs_index=='ndvi',AvgWidthArea>10) %>% 
+  ggplot(aes(rs_value, AH_HydroWithFACCover))+geom_point()+
+  facet_grid(rows=vars(season), cols=vars(WetlandIndicatorRegion))+
+#  facet_grid(rows=vars(season))+
+  geom_smooth(se=FALSE)+
+  stat_cor(method='pearson')
+  
+  
+analysis_dat %>%
+  mutate(
+    elev_bin = cut(
+      Elevation_m,
+      breaks = seq(-100, 3900, by = 1000),
+      labels = paste0(seq(-100, 3400, by = 1000), "–", seq(900, 3900, by = 1000), " m"),
+      include.lowest = TRUE,
+      right = FALSE
+    )
+  ) %>%
+  filter(rs_index == 'ndvi', season=='Jul-Aug',AvgWidthArea>10) %>%
+  ggplot(aes(rs_value, AH_HydroNoFACCover)) +
+    geom_point() +
+   # facet_grid(rows = vars(StateCode), cols = vars(elev_bin)) +
+    # facet_grid(cols = vars(elev_bin)) +
+    #facet_grid(cols = vars(WetlandType)) +
+    geom_smooth(se = FALSE) +
+    stat_cor(method = 'pearson',color='red')
+```
+
+
+
+## RS Load Data
+
+
+```{r Load Data and Define Indicator Columns}
+
+rw_plots <- readRDS(paste0(dat_path, 'scratch/rw_plots.RDS')) %>% filter(EvaluationID != ('CA-APFO-TW-24036_2024-08-30'))
+
+rs_wide_all <- readRDS(paste0(dat_path,'scratch/rs_data_yearofsampling_wide.RDS'))%>% 
+  filter(EvaluationID != ('CA-APFO-TW-24036_2024-08-30')) 
+
+rs_lng_all <- readRDS(paste0(dat_path,'scratch/rs_data_yearofsampling.RDS'))%>% filter(EvaluationID != ('CA-APFO-TW-24036_2024-08-30'))
+
+rs_metric_lkup<- rs_lng_all %>% dplyr::select(satellite:temporal_reducer,spatial_reducer:rs_metric) %>% distinct()
+
+rs_metric_lkup %>% write_csv('AIM_RW/scratch/rs_metric_lkup.csv')
+
+indicators_cln <-  readRDS('AIM_RW/scratch/collated_field_indicators/aim_selected_indicators_wide.RDS') %>% 
+  filter(EvaluationID %in% (rs_wide_all$EvaluationID %>% unique(.))) %>% 
+  filter(EvaluationID != ('CA-APFO-TW-24036_2024-08-30'))
+
+indicators_all <-  readRDS('AIM_RW/scratch/collated_field_indicators/aim_selected_indicators_wide.RDS') %>% 
+  filter(EvaluationID != ('CA-APFO-TW-24036_2024-08-30'))
+
+rs_meta <- readRDS('AIM_RW/scratch/v3_rs_metadata.RDS')%>% 
+  filter(EvaluationID != ('CA-APFO-TW-24036_2024-08-30'))
+
+# rs_data_name_lkup <-  readRDS('AIM_RW/scratch/rs_lkup.RDS')
+
+# Define column name groups
+metadata <- c('EvaluationID','PlotID','SamplingApproach','PlotLayout',
+              'AdminState','StateCode','FieldEvalDate',
+              'Elevation_m','PlotArea_m2','LatitudeWGS84','LongitudeWGS84')
+
+classification <- c('CowardinAttribute','HGMClass',"WetlandType")
+
+condition_indicators <- c('AH_HydroNoFACCover','AH_HydroWithFACCover',
+                          'BareSoilCover','LPI_SiteWetlandValue_CWM',
+                          'LPI_SiteWetlandRating_CWM','TotalFoliarCover')
+
+cover_indicators <- c('FH_AnnualCover','FH_HERB','FH_PFG','FH_ShrubCover','FH_TreeCover','FH_WoodyCover')
+
+indicator_lkup <- tibble(field_indicators = c(condition_indicators,cover_indicators), type = c(rep('Condition',6), rep('Cover',6)))
+
+dat_wide_joined <- indicators_cln %>% 
+  #filter(StateCode == 'NV') %>% 
+  inner_join(rs_wide_all ) %>% 
+  left_join(rw_plots) %>% 
+  mutate(
+    `S2_monthly_MRRMAID-FieldMth-Mesic_NApctArea` = 
+      case_when(
+        month(FieldEvalDate) %in% 4:6 ~ `S2_monthly_MRRMAID-Jun-Mesic_NApctArea`,
+        month(FieldEvalDate) %in% 7 ~ `S2_monthly_MRRMAID-Jul-Mesic_NApctArea`,
+        month(FieldEvalDate) %in% 8 ~ `S2_monthly_MRRMAID-Aug-Mesic_NApctArea`,
+        month(FieldEvalDate) %in% 7 ~ `S2_monthly_MRRMAID-Sep-Mesic_NApctArea`
+      ) 
+  )
+  
+ 
+plot_char <- st_read('~/Library/CloudStorage/OneDrive-DesertResearchInstitute/Projects/BLM-Climate Engine/Side Projects/Northern Nevada R&W Remote Sensing Pilot/Data/AIM R&W/plot_characterization_2022_2024.gpkg') 
+
+avg_width_all_plots <- plot_char %>% 
+  st_drop_geometry() %>% 
+  dplyr::select(EvaluationID,AvgWidthArea)
+
+foo<- indicators_cln %>% group_by(PlotID) %>% mutate(n=n()) %>% 
+  filter(n>1)
+```
+
+## Gpkgs
+
+```{r}
+rw_plots_sf <- st_read('~/Library/CloudStorage/OneDrive-DesertResearchInstitute/Projects/BLM-Climate Engine/Side Projects/Northern Nevada R&W Remote Sensing Pilot/Data/AIM R&W/RW_Plot_Delineation/RW_Plots_JA_20250425/RW_ManualPlots_JA.gpkg') %>% 
+ # st_drop_geometry() %>% 
+  dplyr::select(EvaluationID,PlotID, AvgWidthArea_1,PlotLayout_1) %>% 
+  filter(!is.na(EvaluationID))
+
+rw_plot_centroid <- rw_plots_sf %>% 
+  inner_join(dat_wide_joined) %>% 
+  mutate(area_flag = ifelse(AvgWidthArea_1>10,'Width >10m','Width <10m')) %>% 
+  st_centroid() 
+
+rw_plot_centroid %>% filter(group_by(area_flag)) %>% 
+  tally() %>% 
+  filter(n>1)
+
+rw_plot_centroid %>% group_by(SamplingApproach, area_flag, PlotID) %>% 
+  tally() %>% 
+  filter(n>1)
+
+rw_plot_centroid %>% mapview(zcol='area_flag')
+rw_plot_centroid %>% group_by(area_flag) %>% tally()
+
+rw_plot_centroid %>% filter(area_flag=='Width >10m') %>% pull(PlotID) %>%length()
+
+rw_plot_centroid %>%   
+  st_write('AIM_RW/scratch/GIS/study_plots_w_dat_centroid.gpkg',append=FALSE)
+
+rw_plots_sf %>% 
+  inner_join(dat_wide_joined) %>% 
+    mutate(area_flag = ifelse(AvgWidthArea_1>10,'Included','Excluded')) %>% 
+  st_write('AIM_RW/scratch/GIS/study_plots_w_dat_centroid.gpkg',append=FALSE)
+
+eval_abv_10 <- rw_plot_centroid %>% filter(area_flag=='Width >10m') %>% pull(EvaluationID)
+
+rw_plot_centroid %>% 
+  ggplot(aes(AH_HydroWithFACCover, fill=SamplingApproach))+geom_histogram()
+```
+
+
+# AIM Field Plot Characteristics
+
+after width removal
+```{r}
+
+indicators_cln_abv10 <- indicators_cln %>% 
+  filter(EvaluationID %in% eval_abv_10)
+
+# Function to wrap long labels
+wrap_labels <- function(x, width = 10) {
+  str_wrap(x, width = width)
+}
+# Plot 1: PlotLayout by SamplingApproach
+p0 <- indicators_cln_abv10 %>% 
+  ggplot(aes(PlotLayout, fill = SamplingApproach)) +
+  geom_bar() +
+  scale_fill_ptol() +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+    axis.title.x = element_text(margin = ggplot2::margin(t = 5)),  # Changed from 10 to 5
+    axis.title.y = element_text(margin = ggplot2::margin(r = 10)),
+    plot.margin = ggplot2::margin(5, 10, 5, 5)
+  ) +
+  labs(
+    x = "Plot Layout",
+    y = "Number of Plots",
+    fill = "Sampling Approach"
+  )
+
+# Plot 2: WetlandType by SamplingApproach
+p1 <- indicators_cln_abv10 %>% 
+  ggplot(aes(WetlandType, fill = SamplingApproach)) +
+  geom_bar() +
+  scale_fill_ptol() +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+    axis.title.x = element_text(margin = ggplot2::margin(t = 5)),  # Changed from 10 to 5
+    axis.title.y = element_text(margin = ggplot2::margin(r = 10)),
+    plot.margin = ggplot2::margin(5, 10, 5, 5)
+  ) +
+  labs(
+    x = "Wetland Type",
+    y = "Number of Plots",
+    fill = "Sampling Approach"
+  )
+
+# Plot 3: HGMClass by WetlandType
+p2 <- indicators_cln_abv10 %>% 
+  ggplot(aes(HGMClass, fill = WetlandType)) +
+  geom_bar() +
+  scale_fill_ptol() +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+    axis.title.x = element_text(margin = ggplot2::margin(t = 5)),  # Changed from 10 to 5
+    axis.title.y = element_text(margin = ggplot2::margin(r = 10)),
+    plot.margin = ggplot2::margin(5, 10, 5, 5)
+  ) +
+  labs(
+    x = "HGM Class",
+    y = "Number of Plots",
+    fill = "Wetland Type"
+  )
+
+# Plot 4: PlotLayout by WetlandType
+p3 <- indicators_cln_abv10 %>% 
+  ggplot(aes(PlotLayout, fill = WetlandType)) +
+  geom_bar() +
+  scale_fill_ptol() +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+    axis.title.x = element_text(margin = ggplot2::margin(t = 5)),  # Changed from 10 to 5
+    axis.title.y = element_text(margin = ggplot2::margin(r = 10)),
+    plot.margin = ggplot2::margin(5, 10, 5, 5)
+  ) +
+  labs(
+    x = "Plot Layout",
+    y = "Number of Plots",
+    fill = "Wetland Type"
+  )
+
+# Combine plots with adjusted layout
+combined_plot <- p0 + p1 + p2 + p3 + 
+  plot_layout(ncol = 2) +
+  plot_annotation(
+    title = "Study Area Plot Characteristics",
+    theme = theme(plot.title = element_text(hjust = 0.5, size = 16))
+  )
+
+# Display the combined plot
+combined_plot %>% ggsave('AIM_RW/figures/studyarea_plot_char_abv10.png',.,width=12,height=8)
+
+# Quantative distributions
+
+sites_w_meta<- indicators_cln_abv10 %>% 
+  left_join(rs_meta) %>% 
+  left_join(rw_plots) %>% 
+  dplyr::select(EvaluationID, `Elev (m)`=Elevation_m, `Plot Area (m2)`=PlotArea_m2,`Avg Width (m)`  = AvgWidthArea_1) %>% 
+    pivot_longer(`Elev (m)`:`Avg Width (m)`)
+
+sites_w_meta_all<- indicators_all%>% 
+  left_join(rs_meta) %>% 
+  left_join(rw_plots) %>% 
+  dplyr::select(EvaluationID, `Elev (m)`=Elevation_m, `Plot Area (m2)`=PlotArea_m2,`Avg Width (m)`  = AvgWidthArea_1) %>% 
+    pivot_longer(`Elev (m)`:`Avg Width (m)`)
+
+
+
+
+library(ggplot2)
+library(dplyr)
+# Calculate summary statistics for each group
+summary_stats <- sites_w_meta %>%
+  group_by(name) %>%
+  summarise(
+    median = median(value, na.rm = TRUE),
+    q1 = quantile(value, 0.25, na.rm = TRUE),
+    q3 = quantile(value, 0.75, na.rm = TRUE),
+    .groups = 'drop'
+  )
+
+# Function to calculate density at specific points
+get_density_at_point <- function(data, point) {
+  d <- density(data, na.rm = TRUE)
+  approx(d$x, d$y, xout = point)$y
+}
+
+# Calculate density heights at quartile positions
+summary_stats_with_density <- sites_w_meta %>%
+  group_by(name) %>%
+  do({
+    current_data <- .$value
+    data.frame(
+      name = unique(.$name),
+      median = median(current_data, na.rm = TRUE),
+      q1 = quantile(current_data, 0.25, na.rm = TRUE),
+      q3 = quantile(current_data, 0.75, na.rm = TRUE),
+      median_density = get_density_at_point(current_data, median(current_data, na.rm = TRUE)),
+      q1_density = get_density_at_point(current_data, quantile(current_data, 0.25, na.rm = TRUE)),
+      q3_density = get_density_at_point(current_data, quantile(current_data, 0.75, na.rm = TRUE))
+    )
+  })
+
+# Print the summary statistics
+print("Summary Statistics:")
+print(summary_stats_with_density)
+
+# Calculate bounded densities for each group
+density_data <- sites_w_meta %>%
+  group_by(name) %>%
+  do({
+    vals <- .$value[!is.na(.$value)]
+    d <- density(vals, from = min(vals), to = max(vals))
+    data.frame(
+      name = unique(.$name),
+      x = d$x,
+      y = d$y
+    )
+  })
+
+# Create the plot using geom_ribbon with bounded densities
+p <- ggplot() +
+  # Grey background density
+  geom_density(data = all_sites_w_meta, aes(x = value), 
+               alpha = 0.3, fill = 'grey50') +
+  # Main density with bounded calculation
+  geom_ribbon(data = density_data, aes(x = x, ymin = 0, ymax = y),
+              fill = "lightblue", alpha = 0.8,color='black') +
+  # Median line
+  geom_segment(data = summary_stats_with_density, 
+               aes(x = median, xend = median, y = 0, yend = median_density), 
+               color = "red", linetype = "solid", size = 1) +
+  # Q1 line
+  geom_segment(data = summary_stats_with_density, 
+               aes(x = q1, xend = q1, y = 0, yend = q1_density), 
+               color = "orange", linetype = "dashed", size = 0.8) +
+  # Q3 line
+  geom_segment(data = summary_stats_with_density, 
+               aes(x = q3, xend = q3, y = 0, yend = q3_density), 
+               color = "orange", linetype = "dashed", size = 0.8) +
+  facet_wrap(~name, scales = 'free') +
+  labs(
+    title = "Density Plots with Median and Quartiles",
+    subtitle = "Blue density curve is data at study area sites only\nRed line = Median, Orange dashed lines = Q1 and Q3\nGrey density curve is all 2022-2024 AIM RW sites",
+    x = "Value",
+    y = "Density"
+  ) +
+  theme_bw()
+
+# Display the plot
+print(p)
+p %>% ggsave('AIM_RW/figures/studyarea_rs_meta_density.png', ., width = 10, height = 4)
+
+```
+
+# AIM Field Indicator Exploratory Analysis
+
+```{r density plots}
+# Field Indicator Distributions
+library(ggplot2)
+library(dplyr)
+
+
+# Function to create density plots with quartile lines
+plot_density_with_quartiles <- function(data, 
+                                        data_all,
+                                       value_col = "value", 
+                                       group_col = "name",
+                                       title = "Density Plots with Median and Quartiles",
+                                       subtitle = "Blue density curve is data at study area sites only\nRed line = Median, Orange dashed lines = Q1 and Q3\nGrey density curve is all 2022-2024 AIM RW sites only",
+                                       x_label = "Value",
+                                       y_label = "Density",
+                                       fill_color = "lightblue",
+                                       fill_alpha = 0.7,
+                                       median_color = "red",
+                                       quartile_color = "orange",
+                                       print_stats = TRUE) {
+  
+  # Helper function to calculate density at specific points
+  get_density_at_point <- function(data, point) {
+    d <- density(data, na.rm = TRUE)
+    approx(d$x, d$y, xout = point)$y
+  }
+  
+  # Use NSE (non-standard evaluation) to handle column names
+  value_sym <- rlang::sym(value_col)
+  group_sym <- rlang::sym(group_col)
+  
+  # Calculate density heights at quartile positions
+  summary_stats_with_density <- data %>%
+    group_by(!!group_sym) %>%
+    summarise(
+      median = median(!!value_sym, na.rm = TRUE),
+      q1 = quantile(!!value_sym, 0.25, na.rm = TRUE),
+      q3 = quantile(!!value_sym, 0.75, na.rm = TRUE),
+      median_density = get_density_at_point(!!value_sym, median(!!value_sym, na.rm = TRUE)),
+      q1_density = get_density_at_point(!!value_sym, quantile(!!value_sym, 0.25, na.rm = TRUE)),
+      q3_density = get_density_at_point(!!value_sym, quantile(!!value_sym, 0.75, na.rm = TRUE)),
+      .groups = 'drop'
+    )
+  
+  # Print summary statistics if requested
+  if (print_stats) {
+    cat("Summary Statistics:\n")
+    print(summary_stats_with_density)
+  }
+  
+  # Create the plot
+  p <- data %>% 
+    ggplot(aes(x = !!value_sym)) +
+    geom_density(data=data_all,aes( x= !!value_sym), alpha=0.3,fill='grey50')+
+    geom_density(fill = fill_color, alpha = fill_alpha) +
+    # Median line
+    geom_segment(data = summary_stats_with_density, 
+                 aes(x = median, xend = median, y = 0, yend = median_density), 
+                 color = median_color, linetype = "solid", size = 1) +
+    # Q1 line
+    geom_segment(data = summary_stats_with_density, 
+                 aes(x = q1, xend = q1, y = 0, yend = q1_density), 
+                 color = quartile_color, linetype = "dashed", size = 0.8) +
+    # Q3 line
+    geom_segment(data = summary_stats_with_density, 
+                 aes(x = q3, xend = q3, y = 0, yend = q3_density), 
+                 color = quartile_color, linetype = "dashed", size = 0.8) +
+    facet_wrap(as.formula(paste("~", group_col)), scales = 'free') +
+    labs(
+      title = title,
+      subtitle = subtitle,
+      x = x_label,
+      y = y_label
+    ) +
+    theme_minimal()
+  
+  # Return both the plot and the statistics
+  return(list(plot = p, stats = summary_stats_with_density))
+}
+
+
+indicators_cln_condition <- indicators_cln_abv10 %>% ungroup() %>% 
+   pivot_longer(cols=c(TotalFoliarCover:LPI_SiteWetlandValue_CWM,AH_HydroNoFACCover:FH_ShrubCover)) %>% 
+    mutate(name = factor(name, levels=c(condition_indicators,cover_indicators))) %>% 
+    filter(name %in% condition_indicators) %>% distinct()
+
+indicators_all_condition<- indicators_all %>% ungroup() %>% 
+   pivot_longer(cols=c(TotalFoliarCover:LPI_SiteWetlandValue_CWM,AH_HydroNoFACCover:FH_ShrubCover)) %>% 
+    mutate(name = factor(name, levels=c(condition_indicators,cover_indicators))) %>% 
+    filter(name %in% condition_indicators) %>% distinct()
+
+p_density_condition<- plot_density_with_quartiles(
+  data=indicators_cln_condition,
+  data_all=indicators_all_condition,
+  title = "Field Condition Indicators Plots with Median and Quartiles",
+
+)
+p_density_condition$plot %>% ggsave('AIM_RW/figures/field_condition_density.png',.,width=12,height=8,
+                                     bg = "white")
+
+indicators_cln_cover<- indicators_cln_abv10 %>% 
+  pivot_longer(cols=c(TotalFoliarCover:LPI_SiteWetlandValue_CWM,AH_HydroNoFACCover:FH_ShrubCover)) %>% 
+  mutate(name = factor(name, levels=c(condition_indicators,cover_indicators))) %>% 
+  filter(name %in% cover_indicators) 
+
+indicators_all_cover<- indicators_all %>% ungroup() %>% 
+   pivot_longer(cols=c(TotalFoliarCover:LPI_SiteWetlandValue_CWM,AH_HydroNoFACCover:FH_ShrubCover)) %>% 
+  mutate(name = factor(name, levels=c(condition_indicators,cover_indicators))) %>% 
+  filter(name %in% cover_indicators) 
+
+
+p_density_cover<- plot_density_with_quartiles(
+  data=indicators_cln_cover,
+  data_all=indicators_all_cover,
+  title = "Field Cover Indicators Plots with Median and Quartiles",
+)
+p_density_cover$plot %>% ggsave('AIM_RW/figures/field_cover_density.png',.,width=12,height=8,
+                                     bg = "white")
+
+
+
+
+p_density_condition<- indicators_cln %>% 
+  pivot_longer(cols=c(TotalFoliarCover:LPI_SiteWetlandValue_CWM,AH_HydroNoFACCover:FH_ShrubCover)) %>% 
+  mutate(name = factor(name, levels=c(condition_indicators,cover_indicators))) %>% 
+  filter(name %in% condition_indicators) %>% 
+  ggplot(aes(value))+
+    geom_density()+
+    facet_wrap(~name,scales='free_y',nrow=1)+
+  theme_bw()+
+  labs(x='Percent Cover (%)', title='AIM Condition Indicators - Density Plots')
+
+p_density_cover<- indicators_cln %>% 
+  pivot_longer(cols=c(TotalFoliarCover:LPI_SiteWetlandValue_CWM,AH_HydroNoFACCover:FH_ShrubCover)) %>% 
+  mutate(name = factor(name, levels=c(condition_indicators,cover_indicators))) %>% 
+  filter(name %in% cover_indicators) %>% 
+  ggplot(aes(value))+
+    geom_density()+
+    facet_wrap(~name,scales='free_y',nrow=1)+
+  theme_bw()+
+  labs(
+    x='Percent Cover (%)', 
+    title='AIM Fractional Cover Indicators - Density Plots'
+  )
+
+p_density_condition 
+p_density_cover
+```
+
+```{r AIM indicator correlation matrix} 
+
+# Calculate correlation matrix
+corr_matrix <- cor(
+  indicators_cln %>% dplyr::select(all_of(c(condition_indicators[-5],cover_indicators))), 
+  use = "pairwise.complete.obs",
+  method='spearman')
+
+# Convert correlation matrix to long format for ggplot
+corr_long <- as.data.frame(corr_matrix) %>%
+  rownames_to_column("Var1") %>%
+  pivot_longer(-Var1, names_to = "Var2", values_to = "Correlation")
+
+# Create correlation plot
+p<- ggcorrplot(corr_matrix,
+           hc.order = TRUE,           # Hierarchical clustering
+           type = "lower",            # Show only lower triangle
+           lab = TRUE,                # Show correlation values
+           lab_size = 3,              # Text size for correlation values
+           tl.cex = 8,                # Text size for variable names
+           colors = c("#4575B4", "white", "#D73027"), # Blue-white-red
+           outline.color = "white",   # Border color
+           ggtheme = ggplot2::theme_minimal(),
+           title = "Correlation Matrix of AIM Sensing Indicators",
+           lab_col = "black",         # Label color
+           digits = 2,                # Number of decimal places
+           sig.level = 0.05,          # Significance level
+           insig = "blank")           # Hide insignificant correlations
+
+p %>%  ggsave('AIM_RW/figures/cross_corr_field_indicators.png',.,width=8,height=6,bg = 'white')
+
+```
+
+
+## new figures 2/09
+```{r}
+indicators_all_abv10<- indicators_all %>% 
+  left_join(avg_width_all_plots) %>% 
+  filter(AvgWidthArea>10)
+
+
+indicators_all %>% 
+  ggplot(aes(x=FH_WoodyCover))+
+    stat_ecdf(geom = "step", pad = FALSE) +
+    
+    scale_y_continuous(labels = function(y) y * nrow(data)) +
+    # labs(
+    #   x = "Value",
+    #   y = "Cumulative Count",
+    #   title = "Cumulative Distribution Function"
+    # ) +
+    theme_minimal()
+
+
+plot_cdf <- function(data_full, data_subset, column, x_label = NULL, reverse_x = FALSE) {
+  
+  # Arrange and calculate cumulative counts
+  if (reverse_x) {
+    data_sorted <- data_full %>%
+      arrange(desc({{ column }})) %>%
+      mutate(cumulative_count = row_number())
+    
+    data_sorted_subset <- data_subset %>%
+      arrange(desc({{ column }})) %>%
+      mutate(cumulative_count = row_number())
+  } else {
+    data_sorted <- data_full %>%
+      arrange({{ column }}) %>%
+      mutate(cumulative_count = row_number())
+    
+    data_sorted_subset <- data_subset %>%
+      arrange({{ column }}) %>%
+      mutate(cumulative_count = row_number())
+  }
+  
+  total_n <- nrow(data_sorted)
+  
+  # Default x-axis label if not provided
+  if (is.null(x_label)) {
+    x_label <- deparse(substitute(column))
+  }
+  
+  # Create plot
+  p <- ggplot(data_sorted, aes(x = {{ column }}, y = cumulative_count)) +
+    geom_step() +
+    geom_step(data = data_sorted_subset, color = 'red') +
+    labs(
+      x = x_label,
+      y = "Count"
+    ) +
+    theme_few() +
+    scale_y_continuous(
+      limits = c(0, NA),
+      breaks = c(0, 50, 100, 250, 500, 750, 1000, 1250),
+      expand = c(0, 0),  # Remove padding on y-axis
+      sec.axis = sec_axis(~ . / total_n * 100, 
+                          name = "Percent Total")
+    ) +
+    scale_x_continuous(expand = c(0, 0), limits=c(0,100))  # Remove padding on x-axis
+  
+  # Add reversed x-axis if requested
+  if (reverse_x) {
+    p <- p + scale_x_reverse(expand = c(0, 0))
+  }
+  
+  return(p)
+}
+# Use it like this:
+cdf_NOhydroFAC <- plot_cdf(indicators_all, indicators_all_abv10, 
+                           AH_HydroNoFACCover, 
+                           x_label = "AH_HydroNoFACCover (%)")
+
+cdf_WithhydroFAC <- plot_cdf(indicators_all, indicators_all_abv10, 
+                           AH_HydroWithFACCover, 
+                           x_label = "AH_HydroWithFACCover (%)")
+
+cdf_Foliar <- plot_cdf(indicators_all, indicators_all_abv10, 
+                           TotalFoliarCover, 
+                           x_label = "TotalFoliarCover (%)")
+p<- cdf_Foliar+ cdf_WithhydroFAC+cdf_NOhydroFAC
+p %>% ggsave('AIM_RW/figures/cdf_plots_condition.png',.,width = 14,height=4)
+# Or with a different column:
+cdf_tree <- plot_cdf(indicators_all, indicators_all_abv10, 
+                      FH_TreeCover, reverse_x = TRUE,
+                      x_label = "FH_TreeCover")
+
+cdf_shrub<- plot_cdf(indicators_all, indicators_all_abv10, 
+                      FH_ShrubCover, reverse_x = TRUE,
+                      x_label = "FH_ShrubCover")
+
+cdf_woody <- plot_cdf(indicators_all, indicators_all_abv10, 
+                      FH_WoodyCover, reverse_x = TRUE,
+                      x_label = "FH_WoodyCover")
+
+# cdf_herb <- plot_cdf(indicators_all, indicators_all_abv10, 
+#                       FH_AnnualCover, reverse_x = TRUE,
+#                       x_label = "FH_AnnualCover")
+
+p_woody<- cdf_tree + cdf_shrub +cdf_woody
+
+p_woody %>% ggsave('AIM_RW/figures/cdf_plots_woody_cover.png',.,width = 14,height=4)
+
+```
+
+
+# Remote Sensing Metric Exploratory Analysis
+
+# RS Metrics Distributions
+
+```{r}
+
+# # Create a design layout for manual faceting
+# # First, identify which metrics belong to each metric type
+# metric_types <- unique(rs_cln_lng$metric_type)
+# 
+# # First, create a new column that combines metric_type and cln_metric_name
+# # This will help us organize the nested faceting
+# rs_cln_lng <- rs_cln_lng %>%
+#   mutate(metric_group = paste(metric_type, cln_metric_name, sep = "__"))
+# 
+# # Get the order of metric types to ensure consistent ordering
+# metric_type_order <- unique(rs_cln_lng$metric_type)
+# Create the plot with nested facets and improved aesthetics
+p <- rs_lng_all %>%
+  ggplot(aes(rs_value)) +
+  geom_density(fill = "steelblue", alpha = 0.3, color = "steelblue4", linewidth = 0.7) +
+  facet_wrap(~rs_metric,scales='free')+
+  theme_minimal(base_size=7)+
+  # # Use facet_nested_wrap with improved styling
+  # facet_nested_wrap(
+  #   ~ metric_type + cln_metric_name,
+  #   scales = "free",
+  #   nest_line = TRUE,
+  #   dir = "h",
+  #   strip = strip_nested(
+  #     background_y = list(element_rect(fill = "#5b7fa3", color = "white")),
+  #     text_y = list(element_text(face = "bold", size = 11, color = "white", margin = margin(5, 0, 5, 0))),
+  #     background_x = list(element_rect(fill = "#e6e6e6", color = "white")),
+  #     text_x = list(element_text(size = 8, margin = margin(2, 0, 2, 0)))
+  #   )
+  # ) +
+  # # Clean modern theme
+  # theme_minimal() +
+  # theme(
+  #   # Panel styling
+  #   panel.background = element_rect(fill = "white", color = NA),
+  #   panel.grid.major = element_line(color = "#f0f0f0", linewidth = 0.3),
+  #   panel.grid.minor = element_line(color = "#f5f5f5", linewidth = 0.2),
+  #   panel.border = element_rect(color = "white", fill = NA, linewidth = 0.5),
+  #   panel.spacing = unit(0.4, "lines"),
+  #   
+  #   # Facet styling
+  #   strip.placement = "outside",
+  #   strip.text = element_text(color = "#333333"),
+  #   
+  #   # Axis styling
+  #   axis.title = element_text(size = 10, face = "bold", color = "#333333"),
+  #   axis.text = element_text(size = 8, color = "#333333"),
+  #   axis.text.x = element_text(margin = margin(t = 3)),
+  #   axis.text.y = element_text(margin = margin(r = 3)),
+  #   axis.ticks = element_line(color = "#cccccc", linewidth = 0.3),
+  #   
+  #   # Plot styling
+  #   plot.title = element_text(size = 16, face = "bold", hjust = 0.5, margin = margin(b = 20)),
+  #   plot.subtitle = element_text(size = 11, hjust = 0.5, margin = margin(b = 10)),
+  #   plot.caption = element_text(size = 8, color = "#666666", hjust = 1),
+  #   plot.margin = margin(15, 15, 15, 15),
+  #   plot.background = element_rect(fill = "white", color = NA)
+  # ) +
+  labs(
+    x = "Value",
+    y = "Density",
+    title = "Distribution of Remote Sensing Metrics",
+    subtitle = "Density plots by metric type and measurement"
+  )
+
+# Print the plot
+p %>% ggsave('AIM_RW/figures/density_rs_metrics.png',.,width=16,height=12,bg = 'white')
+```
+
+
+```{r correlation matrix}
+
+# Calculate correlation matrix
+corr_matrix <- cor(
+  rs_wide_all %>% dplyr::select(-year, -EvaluationID) %>% filter(), 
+  use = "pairwise.complete.obs",
+  method='spearman')
+
+as.data.frame(corr_matrix) %>%  
+  rownames_to_column(var='var') %>% 
+  write_csv('AIM_RW/scratch/rs_metric_correlations.csv')
+
+# Create a data frame from the correlation matrix
+corr_df <- as.data.frame(corr_matrix) %>%
+  rownames_to_column("metric_name") %>%
+ # left_join(rs_data_name_lkup %>% dplyr::select(-full_metric_name)) %>% 
+  rename(Var1 = metric_name) %>% 
+  pivot_longer(cols=`LS_amj_ndvi_median`:`S2_jas_ndvi_median_pctarea-gt0.4`, 
+               names_to = "metric_name", values_to = "Correlation") %>% 
+ # left_join(rs_data_name_lkup %>% dplyr::select(-full_metric_name)) %>% 
+  rename(Var2 = metric_name) 
+
+
+# Create the faceted correlation heatmap
+p_corr<- ggplot(corr_df, aes(x = Var2, y = Var1, fill = Correlation)) +
+  geom_tile() +
+  # facet_grid(Var1_metric_type ~ Var2_metric_type, scales = "free", space = "free",
+  #            labeller = labeller(Var1_metric_type = label_wrap_gen(width = 12),
+  #                               Var2_metric_type = label_wrap_gen(width = 12))) +
+  scale_fill_gradient2(low = "#4575B4", mid = "white", high = "#D73027", 
+                      midpoint = 0, limits = c(-1, 1)) +
+  theme_minimal(base_size=7) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        strip.background = element_rect(fill = "lightgrey"),
+        strip.text = element_text(face = "bold")) +
+  geom_text(aes(label = ifelse(abs(Correlation) >= 0, 
+                              sprintf("%.2f", Correlation), "")), 
+           size = 1) +
+  labs(x='',y='',title = "Correlation Matrix of Remote Sensing Metrics")
+
+p_corr%>% ggsave('AIM_RW/figures/cross_corr_rs_metrics.png',.,width=16,height=12,bg = 'white')
+```
+
+
+# Width to Correlations
+
+```{r}
+
+
+# Method 3: Automated midpoint calculation
+breaks <- c(0, 5, 10,15, 20, 30, 40, 50, 60)
+midpoints <- (breaks[-1] + breaks[-length(breaks)]) / 2
+
+dat_wide_joined %>% 
+  left_join(rw_plots) %>% 
+     mutate(width_group = cut(AvgWidthArea_1, breaks = breaks)) %>% 
+  group_by(width_group) %>% tally()
+
+
+
+cor_by_width<- dat_wide_joined %>% 
+  dplyr::select(EvaluationID,AvgWidthArea_1,condition_indicators[-5],cover_indicators,`S2 JAS NDVI` =s2_jas_ndvi_median,
+                `LS JAS NDVI` =`LS_jas_ndvi_median`) %>% 
+   mutate(
+     width_group = cut(AvgWidthArea_1, breaks = c(0, 5,10, 15,20, 30,40,50,60)),
+     width_midpoints =midpoints[as.numeric(width_group)]
+   ) %>% 
+  pivot_longer(cols= c(condition_indicators[-5], 
+      cover_indicators), values_to = 'field_value',names_to='field_indicators') %>% 
+  pivot_longer(`S2 JAS NDVI`:`LS JAS NDVI`,names_to='rs_metric',values_to='rs_value') %>% 
+  filter(field_indicators %in% condition_indicators ) %>% 
+  # filter(
+  #   cln_metric_name %in% 
+  #     c('NDVI: Early Season','NDVI: Late Season','NDWI: Late Season','MVP: Late Season','RRI: Landsar 5 year','NDVI: Seasonal Difference')
+  # ) %>% 
+  group_by(width_midpoints,rs_metric, field_indicators) %>% 
+  summarise(cor=cor(rs_value, field_value, method='spearman',  use = "pairwise.complete.obs"), n= n()) %>% 
+  filter(!is.na(width_midpoints))
+
+p_bin_barchart<- cor_by_width %>% 
+  ungroup() %>% 
+  dplyr::select(width_midpoints, n) %>% 
+  distinct() %>% 
+  mutate(
+    width_bin = case_when(
+      width_midpoints==2.5 ~ '1-5',
+      width_midpoints==7.5 ~ '5-10',
+      width_midpoints==12.5 ~ '10-15',
+      width_midpoints==17.5 ~ '15-20',
+      width_midpoints==25 ~ '20-30',
+      width_midpoints==35 ~ '30-40',
+      width_midpoints==45 ~ '40-50',
+      width_midpoints==55 ~ '50-60'
+    ),
+    width_bin = fct_reorder(factor(width_bin), width_midpoints),
+    abv10 = width_midpoints > 10
+  ) %>% 
+  ggplot(aes(width_bin, n, fill=abv10),color='black')+
+  geom_col()+
+  scale_fill_manual(values=c('grey75','#4575B4'), guide='none')+
+  labs(x='Plot Width Bin (m)',y='Number of Plots')+
+  theme_minimal()
+p_bin_barchart %>% ggsave('AIM_RW/figures/plot_width_bin_counts.png',.,width=5,height=4,bg = 'white')
+
+
+#Function to find significant breakpoints using only Davies' test
+find_significant_thresholds <- function(data,alpha=0.2) {
+  results <- data.frame(
+    field_indicator = character(),
+    rs_metric = character(),
+    threshold = numeric(),
+    p_value = numeric(),
+    significant = logical(),
+    plateau_cor = numeric(),
+    stringsAsFactors = FALSE
+  )
+  
+  for (fi in unique(data$field_indicators)) {
+    for (rm in unique(data$rs_metric)) {
+      subset_data <- data %>% 
+        filter(field_indicators == fi, rs_metric == rm) %>%
+        arrange(width_midpoints)
+      
+      if (nrow(subset_data) < 6) next
+      
+      # Fit linear model first
+      lm_fit <- lm(cor ~ width_midpoints, data = subset_data)
+      
+      # Run Davies' test with recommended k value (k=10)
+      tryCatch({
+        # Test if a breakpoint exists
+        davies <- davies.test(lm_fit, ~width_midpoints, k = 10)
+        p_value <- davies$p.value
+        
+        # Only proceed with segmented regression if Davies' test is significant
+        if (p_value < alpha) {
+          # Fit segmented model
+          seg_fit <- segmented(lm_fit, seg.Z = ~width_midpoints, 
+                              psi = median(subset_data$width_midpoints))
+          
+          # Extract threshold
+          threshold <- seg_fit$psi[,"Est."]
+          
+          # Calculate plateau correlation
+          plateau_data <- subset_data %>% filter(width_midpoints >= threshold)
+          plateau_cor <- mean(plateau_data$cor, na.rm = TRUE)
+          
+          # Add to results
+          results <- rbind(results, data.frame(
+            field_indicator = fi,
+            rs_metric = rm,
+            threshold = threshold,
+            p_value = p_value,
+            significant = TRUE,  # Always TRUE since we're only adding if p_value < 0.05
+            plateau_cor = plateau_cor,
+            stringsAsFactors = FALSE
+          ))
+        }
+      }, error = function(e) {
+        # Print error to help debugging
+        cat("Error with", fi, rm, ":", conditionMessage(e), "\n")
+      })
+    }
+  }
+  
+  return(results)
+}
+
+# Function to plot only significant breakpoints
+plot_significant_thresholds <- function(data, thresholds,alpha) {
+  # Create a complete dataset that includes all combinations
+  all_combos <- expand.grid(
+    field_indicators = unique(data$field_indicators),
+    rs_metric = unique(data$rs_metric),
+    stringsAsFactors = FALSE
+  )
+  
+  # Left join with the threshold results (only significant ones will have values)
+  plot_data <- all_combos %>%
+    left_join(thresholds, 
+              by = c("field_indicators" = "field_indicator", 
+                    "rs_metric" = "rs_metric")) %>%
+    left_join(data, by = c("field_indicators", "rs_metric"))
+  
+  # Create the plot
+  p <- ggplot(plot_data, aes(width_midpoints, cor)) +
+    geom_point(alpha = 0.7) +
+    geom_smooth(span = 1, se = FALSE, color = "#4575B4", linewidth = 1) +
+    
+    # Only add threshold lines if significant (not NA)
+    geom_vline(data = filter(plot_data, !is.na(threshold)),
+               aes(xintercept = threshold), 
+               color = "#D73027", linetype = "dashed") +
+    
+    geom_hline(data = filter(plot_data, !is.na(plateau_cor)),
+               aes(yintercept = plateau_cor), 
+               color = "#4DAF4A", linetype = "dashed") +
+    
+    # Add annotations only for significant breakpoints
+    geom_text(data = filter(plot_data, !is.na(threshold)),
+              aes(x = threshold, y = min(cor, na.rm = TRUE),
+                  label = sprintf("Threshold: %.1f m", threshold, p_value)),
+              color = "#D73027", hjust = -0.1, vjust = 0, size = 2.5) +
+    
+    facet_grid(rows = vars(field_indicators), 
+               cols = vars(rs_metric), 
+               scales = 'free') +
+    
+    theme_bw() +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      strip.background = element_rect(fill = "#5b7fa3"),
+      strip.text = element_text(face = "bold", color = "white"),
+      panel.grid.minor = element_blank()
+    ) +
+    
+    labs(
+      title = "Plot Width Thresholds for Field-RS Correlations",
+      subtitle = paste0("Red lines indicate estimated breakpoint locations from segmented regression. Breakpoints shown only when \nDavies' test (p < ", alpha, ") provides evidence that a breakpoint exists. Green lines indicate mean correlations \nfor plot widths above the breakpoint." ),
+      x = "Plot Width (m)",
+      y = "Correlation (rho)"
+    )
+  
+  return(p)
+}
+
+# Apply to your data
+significant_thresholds <- find_significant_thresholds(cor_by_width,alpha=0.25)
+
+# Print summary of results
+print(significant_thresholds)
+
+# Create and display the plot
+threshold_plot <- plot_significant_thresholds(cor_by_width, significant_thresholds,alpha=0.25)
+print(threshold_plot)
+
+# Create a summary table of thresholds
+summary_table <- threshold_results %>%
+  arrange(field_indicator, rs_metric) %>%
+  mutate(
+    stability = ifelse(p_value > 0.05, "Stable", "Not stable"),
+    threshold_rounded = round(threshold, 1),
+    plateau_cor_rounded = round(plateau_cor, 2)
+  ) %>%
+  dplyr::select(
+    `Field Indicator` = field_indicator,
+    `RS Metric` = rs_metric,
+    `Width Threshold (m)` = threshold_rounded,
+    `Plateau Correlation` = plateau_cor_rounded,
+    `Stability P-value` = p_value,
+    `Stability Status` = stability
+  )
+
+# Print the summary table
+print(summary_table)
+
+threshold_plot %>% ggsave('AIM_RW/figures/plot_width_thresholds.png',.,width=8,height=10,bg = 'white')
+```
+
+# Calculate Beta Regressions
+
+```{r}
+dat_lng_joined<- dat_wide_joined %>% 
+  filter(AvgWidthArea_1>10) %>% 
+  dplyr::select(
+    EvaluationID,TotalFoliarCover:FH_ShrubCover,LS_amj_ndvi_median:`S2_jas_ndvi_median_pctarea-gt0.4`,
+    `S2_monthly_MRRMAID-FieldMth-Mesic_NApctArea`) %>% 
+  dplyr::select(-LPI_SiteWetlandRating_CWM) %>% 
+  pivot_longer(TotalFoliarCover:FH_ShrubCover, names_to = 'field_indicators',values_to = 'field_value') %>% 
+  pivot_longer(c(LS_amj_ndvi_median:`S2_jas_ndvi_median_pctarea-gt0.4`,
+                 `S2_monthly_MRRMAID-FieldMth-Mesic_NApctArea`), names_to = 'rs_metric',values_to = 'rs_value')
+
+dat_split <- dat_lng_joined %>% group_by(field_indicators,rs_metric ) %>% group_split()
+
+library(betareg)
+
+#' Simple Beta Regression for Mapping Over Grouped Data
+#' 
+#' Fits beta regression with automatic link selection for a single dataset
+#'
+#' @param data Data frame with predictor and response columns
+#' @return List with model stats, plot, and plot data
+
+fit_beta_model <- function(data) {
+  
+  response <- data$field_indicators[1]
+  predictor <- data$rs_metric[1]
+  
+  # Prepare data
+  x <-  data$rs_value
+  y <-  data$field_value / 100  # Transform to 0-1
+  
+  # Handle boundaries
+  y[y == 0] <- 0.001
+  y[y == 1] <- 0.999
+  
+  # Remove missing values
+  complete_idx <- complete.cases(x, y)
+  x <- x[complete_idx]
+  y <- y[complete_idx]
+  
+  model_data <- data.frame(x = x, y = y)
+  
+  # Test link functions
+  logit_model <- betareg(y ~ x, data = model_data, link = "logit")
+  probit_model <- betareg(y ~ x, data = model_data, link = "probit")
+  cloglog_model <- betareg(y ~ x, data = model_data, link = "cloglog")
+  
+  # Select best model by BIC
+  bics <- c(logit = BIC(logit_model), 
+            probit = BIC(probit_model), 
+            cloglog = BIC(cloglog_model))
+  
+  best_link <- names(which.min(bics))
+  best_model <- get(paste0(best_link, "_model"))
+  
+  # Create predictions for plot
+  x_seq <- seq(min(x), max(x), length.out = 100)
+  pred_data <- data.frame(x = x_seq)
+  
+  # Get model matrix for new predictions
+  X_new <- model.matrix(~ x, data = pred_data)
+  
+   # Get coefficient covariance matrix (only for mean parameters)
+  vcov_full <- vcov(best_model)
+  n_mean_coefs <- ncol(X_new)
+  vcov_mean <- vcov_full[1:n_mean_coefs, 1:n_mean_coefs]
+  
+  # Calculate standard errors on link scale
+  # SE = sqrt(X * Vcov * X')
+  pred_se_link <- sqrt(rowSums((X_new %*% vcov_mean) * X_new))
+  
+  # Get predictions on link scale
+  pred_link <- predict(best_model, newdata = pred_data, type = "link")
+  
+  # Calculate confidence intervals on link scale
+  lower_link <- pred_link - 1.96 * pred_se_link
+  upper_link <- pred_link + 1.96 * pred_se_link
+  
+  # Transform to response scale using inverse link function
+  if (best_link == "logit") {
+    fitted <- plogis(pred_link)
+    lower <- plogis(lower_link)
+    upper <- plogis(upper_link)
+  } else if (best_link == "probit") {
+    fitted <- pnorm(pred_link)
+    lower <- pnorm(lower_link)
+    upper <- pnorm(upper_link)
+  } else {  # cloglog
+    fitted <- 1 - exp(-exp(pred_link))
+    lower <- 1 - exp(-exp(lower_link))
+    upper <- 1 - exp(-exp(upper_link))
+  }
+  
+  # Extract precision parameter from model
+  phi <- best_model$coefficients$precision
+  
+  # Compute 95% prediction interval bounds
+  # qbeta() gives the quantiles of the Beta distribution
+  lower_pred <- qbeta(0.025, shape1 = fitted * phi, shape2 = (1 - fitted) * phi)
+  upper_pred <- qbeta(0.975, shape1 = fitted * phi, shape2 = (1 - fitted) * phi)
+  
+  # Create plot data table (convert back to 0-100 scale)
+  plot_data <- data.frame(
+    predictor_name = predictor,
+    response_name = response,
+    predictor_value = x_seq,
+    fitted = fitted * 100,
+    lower_ci = lower * 100,
+    upper_ci = upper * 100,
+    lower_pred = lower_pred * 100,
+    upper_pred = upper_pred * 100
+  )
+  
+  # Create observed data table
+  obs_data <- data.frame(
+    predictor_name = predictor,
+    response_name = response,
+    predictor_value = x, 
+    observed_value = y * 100
+  )
+  
+  # Create plot
+  p <- ggplot() +
+    geom_point(data = obs_data, aes(x = predictor_value, y = observed_value), alpha = 0.6) +
+    geom_line(data = plot_data, aes(x = predictor_value, y = fitted), color = "red", size = 1) +
+    geom_ribbon(data = plot_data, aes(x = predictor_value, ymin = lower_ci, ymax = upper_ci),
+              fill = "red", alpha = 0.2) +  # Confidence interval
+    geom_ribbon(data = plot_data, aes(x = predictor_value, ymin = lower_pred, ymax = upper_pred),
+              fill = "blue", alpha = 0.1) +  # Prediction interval
+    labs(
+      title = paste(predictor, "vs", response),
+      subtitle = paste0("Link: ", best_link, ", Pseudo R² = ", round(best_model$pseudo.r.squared, 3)),
+      x = predictor,
+      y = response
+    ) +
+    theme_minimal()
+  
+  # Return results including plot data
+  list(
+    predictor = predictor,
+    response = response,
+    link = best_link,
+    pseudo_r2 = best_model$pseudo.r.squared,
+    aic = AIC(best_model),
+    bic = BIC(best_model),
+    p_value = summary(best_model)$coefficients$mean[2, 4],
+    n = length(x),
+    model = best_model,
+    plot = p,
+    plot_data = plot_data,        # NEW: Prediction data for plotting
+    observed_data = obs_data      # NEW: Observed data for plotting
+  )
+}
+
+safe_fit_beta_model <- safely(fit_beta_model)
+
+# Apply to all items
+results <- dat_split %>% map(safe_fit_beta_model)
+
+# Separate successful and failed results
+successes <- results %>% keep(~ is.null(.x$error)) %>% map("result")
+failures <- results %>% keep(~ !is.null(.x$error))
+
+# Save results with plot data
+successes %>% saveRDS('AIM_RW/scratch/beta_regression/results_list.RDS')
+
+# Create summary dataframe
+summary_df <- successes %>% 
+  map_dfr(~ tibble(
+    predictor = .x$predictor,
+    response  = .x$response,
+    link      = .x$link,
+    pseudo_r2 = .x$pseudo_r2,
+    aic       = .x$aic,
+    bic       = .x$bic,
+    p_value   = .x$p_value,
+    n         = .x$n
+  ))
+
+summary_df %>% saveRDS('AIM_RW/scratch/beta_regression/results_summary.RDS')
+summary_df %>% write_csv('AIM_RW/scratch/beta_regression/results_summary.csv')
+summary_df %>% dplyr::select(predictor, response, pseudo_r2) %>% 
+  pivot_wider(names_from = response, values_from = pseudo_r2) %>% 
+  dplyr::select(predictor,all_of(condition_indicators[-5]), all_of(cover_indicators)) %>% 
+  write_csv('AIM_RW/scratch/beta_regression/results_summary_wide.csv')
+  
+# Example: How to create combined plots for the same response variable
+# with different predictors on the same scale
+
+create_combined_plot <- function(results_list, response_var, predictor1, predictor2) {
+  
+  # Extract relevant results
+  result1 <- results_list %>% keep(~ .x$response == response_var & .x$predictor == predictor1) %>% .[[1]]
+  result2 <- results_list %>% keep(~ .x$response == response_var & .x$predictor == predictor2) %>% .[[1]]
+  
+  if(is.null(result1) || is.null(result2)) {
+    stop("One or both predictor-response combinations not found in results")
+  }
+  
+  # Combine plot data with pseudo R² info
+  combined_plot_data <- bind_rows(
+    result1$plot_data %>% mutate(model = paste0("Model 1: ", predictor1, " (R² = ", round(result1$pseudo_r2, 3), ")")),
+    result2$plot_data %>% mutate(model = paste0("Model 2: ", predictor2, " (R² = ", round(result2$pseudo_r2, 3), ")"))
+  )
+  
+  # Combine observed data with pseudo R² info
+  combined_obs_data <- bind_rows(
+    result1$observed_data %>% mutate(model = paste0("Model 1: ", predictor1, " (R² = ", round(result1$pseudo_r2, 3), ")")),
+    result2$observed_data %>% mutate(model = paste0("Model 2: ", predictor2, " (R² = ", round(result2$pseudo_r2, 3), ")"))
+  )
+  
+  # Determine which model has better fit
+  better_model <- ifelse(result1$pseudo_r2 > result2$pseudo_r2, predictor1, predictor2)
+  better_r2 <- max(result1$pseudo_r2, result2$pseudo_r2)
+  
+  # Create combined plot
+  ggplot() +
+    geom_point(data = combined_obs_data, 
+               aes(x = predictor_value, y = observed_value, color = model), 
+               alpha = 0.6) +
+    geom_line(data = combined_plot_data, 
+              aes(x = predictor_value, y = fitted, color = model), 
+              size = 1) +
+    geom_ribbon(data = combined_plot_data, 
+                aes(x = predictor_value, ymin = lower_ci, ymax = upper_ci, fill = model),
+                alpha = 0.2) +
+    labs(
+      title = paste("Comparison of predictors for", response_var),
+      subtitle = paste("Best model:", better_model, "with Pseudo R² =", round(better_r2, 3)),
+      x = "Predictor Value",
+      y = response_var,
+      color = "Model",
+    ) +
+    theme_minimal() +
+    theme(legend.position = "bottom",
+          legend.title = element_text(size = 10),
+          legend.text = element_text(size = 9))+
+    scale_color_few()+
+    scale_fill_few(guide='none')
+}
+
+unique(dat_lng_joined$rs_metric)
+unique(dat_lng_joined$field_indicators)
+combined_plot
+
+AH_HydroWithFACCover <- create_combined_plot(successes, "AH_HydroWithFACCover","LS_jas_rri-speirsq-5yr_annual_mean", "LS_jas_rri-prrsq-5yr_annual_mean")
+
+```
+
+
+# Calculate Beta Regressions - by Wetland Type
+
+```{r}
+dat_lng_joined<- dat_wide_joined %>% 
+  filter(AvgWidthArea_1>10) %>% 
+  dplyr::select(
+    WetlandType, EvaluationID,TotalFoliarCover:FH_ShrubCover,LS_amj_ndvi_median:`S2_jas_ndvi_median_pctarea-gt0.4`,
+    `S2_monthly_MRRMAID-FieldMth-Mesic_NApctArea`) %>% 
+  dplyr::select(-LPI_SiteWetlandRating_CWM) %>% 
+  pivot_longer(TotalFoliarCover:FH_ShrubCover, names_to = 'field_indicators',values_to = 'field_value') %>% 
+  pivot_longer(c(LS_amj_ndvi_median:`S2_jas_ndvi_median_pctarea-gt0.4`,`S2_monthly_MRRMAID-FieldMth-Mesic_NApctArea`), names_to = 'rs_metric',values_to = 'rs_value') %>% 
+  filter(WetlandType!='Fen or Bog') %>% 
+  mutate(WetlandType = ifelse(WetlandType == 'Riparian Shrubland', 'Riparian Shrubland or Shrub Wetland',WetlandType ))
+
+dat_split <- dat_lng_joined %>% 
+  filter(rs_metric=='s2_jas_ndvi_median') %>% 
+  group_by(field_indicators,rs_metric,WetlandType ) %>% group_split()
+
+library(betareg)
+
+#' Simple Beta Regression for Mapping Over Grouped Data
+#' 
+#' Fits beta regression with automatic link selection for a single dataset
+#'
+#' @param data Data frame with predictor and response columns
+#' @return List with model stats, plot, and plot data
+data <- dat_split[[1]]
+fit_beta_model <- function(data) {
+  
+  response <- data$field_indicators[1]
+  predictor <- data$rs_metric[1]
+  wetland_type <-  data$WetlandType[1]
+  # Prepare data
+  x <-  data$rs_value
+  y <-  data$field_value / 100  # Transform to 0-1
+  
+  # Handle boundaries
+  y[y == 0] <- 0.001
+  y[y == 1] <- 0.999
+  
+  # Remove missing values
+  complete_idx <- complete.cases(x, y)
+  x <- x[complete_idx]
+  y <- y[complete_idx]
+  
+  model_data <- data.frame(x = x, y = y)
+  
+  # Test link functions
+  logit_model <- betareg(y ~ x, data = model_data, link = "logit")
+  probit_model <- betareg(y ~ x, data = model_data, link = "probit")
+  cloglog_model <- betareg(y ~ x, data = model_data, link = "cloglog")
+  
+  # Select best model by BIC
+  bics <- c(logit = BIC(logit_model), 
+            probit = BIC(probit_model), 
+            cloglog = BIC(cloglog_model))
+  
+  best_link <- names(which.min(bics))
+  best_model <- get(paste0(best_link, "_model"))
+  
+  # Create predictions for plot
+  x_seq <- seq(min(x), max(x), length.out = 100)
+  pred_data <- data.frame(x = x_seq)
+  
+  # Get model matrix for new predictions
+  X_new <- model.matrix(~ x, data = pred_data)
+  
+   # Get coefficient covariance matrix (only for mean parameters)
+  vcov_full <- vcov(best_model)
+  n_mean_coefs <- ncol(X_new)
+  vcov_mean <- vcov_full[1:n_mean_coefs, 1:n_mean_coefs]
+  
+  # Calculate standard errors on link scale
+  # SE = sqrt(X * Vcov * X')
+  pred_se_link <- sqrt(rowSums((X_new %*% vcov_mean) * X_new))
+  
+  # Get predictions on link scale
+  pred_link <- predict(best_model, newdata = pred_data, type = "link")
+  
+  # Calculate confidence intervals on link scale
+  lower_link <- pred_link - 1.96 * pred_se_link
+  upper_link <- pred_link + 1.96 * pred_se_link
+  
+  # Transform to response scale using inverse link function
+  if (best_link == "logit") {
+    fitted <- plogis(pred_link)
+    lower <- plogis(lower_link)
+    upper <- plogis(upper_link)
+  } else if (best_link == "probit") {
+    fitted <- pnorm(pred_link)
+    lower <- pnorm(lower_link)
+    upper <- pnorm(upper_link)
+  } else {  # cloglog
+    fitted <- 1 - exp(-exp(pred_link))
+    lower <- 1 - exp(-exp(lower_link))
+    upper <- 1 - exp(-exp(upper_link))
+  }
+  
+  # Extract precision parameter from model
+  phi <- best_model$coefficients$precision
+  
+  # Compute 95% prediction interval bounds
+  # qbeta() gives the quantiles of the Beta distribution
+  lower_pred <- qbeta(0.025, shape1 = fitted * phi, shape2 = (1 - fitted) * phi)
+  upper_pred <- qbeta(0.975, shape1 = fitted * phi, shape2 = (1 - fitted) * phi)
+  
+  # Create plot data table (convert back to 0-100 scale)
+  plot_data <- data.frame(
+    predictor_name = predictor,
+    response_name = response,
+    wetlandtype = wetland_type,
+    predictor_value = x_seq,
+    fitted = fitted * 100,
+    lower_ci = lower * 100,
+    upper_ci = upper * 100,
+    lower_pred = lower_pred * 100,
+    upper_pred = upper_pred * 100
+  )
+  
+  # Create observed data table
+  obs_data <- data.frame(
+    predictor_name = predictor,
+    response_name = response,
+    wetlandtype = wetland_type,
+    predictor_value = x, 
+    observed_value = y * 100
+  )
+  
+  # Create plot
+  p <- ggplot() +
+    geom_point(data = obs_data, aes(x = predictor_value, y = observed_value), alpha = 0.6) +
+    geom_line(data = plot_data, aes(x = predictor_value, y = fitted), color = "red", size = 1) +
+    geom_ribbon(data = plot_data, aes(x = predictor_value, ymin = lower_ci, ymax = upper_ci),
+              fill = "red", alpha = 0.2) +  # Confidence interval
+    geom_ribbon(data = plot_data, aes(x = predictor_value, ymin = lower_pred, ymax = upper_pred),
+              fill = "blue", alpha = 0.1) +  # Prediction interval
+    labs(
+      title = paste(wetland_type, ': ',predictor, "vs", response),
+      subtitle = paste0("Link: ", best_link, ", Pseudo R² = ", round(best_model$pseudo.r.squared, 3)),
+      x = predictor,
+      y = response
+    ) +
+    theme_minimal()
+  
+  # Return results including plot data
+  list(
+    predictor = predictor,
+    response = response,
+    link = best_link,
+    wetland_type = wetland_type,
+    pseudo_r2 = best_model$pseudo.r.squared,
+    aic = AIC(best_model),
+    bic = BIC(best_model),
+    p_value = summary(best_model)$coefficients$mean[2, 4],
+    n = length(x),
+    model = best_model,
+    plot = p,
+    plot_data = plot_data,        # NEW: Prediction data for plotting
+    observed_data = obs_data      # NEW: Observed data for plotting
+  )
+}
+
+safe_fit_beta_model <- safely(fit_beta_model)
+
+# Apply to all items
+results <- dat_split %>% map(safe_fit_beta_model)
+
+# Separate successful and failed results
+successes <- results %>% keep(~ is.null(.x$error)) %>% map("result")
+failures <- results %>% keep(~ !is.null(.x$error))
+
+# Save results with plot data
+successes %>% saveRDS('AIM_RW/scratch/beta_regression/results_list_by_wetType.RDS')
+
+# Create summary dataframe
+summary_df <- successes %>% 
+  map_dfr(~ tibble(
+    predictor = .x$predictor,
+    response  = .x$response,
+    wetland_type  = .x$observed_data$wetlandtype[1],
+    link      = .x$link,
+    pseudo_r2 = .x$pseudo_r2,
+    aic       = .x$aic,
+    bic       = .x$bic,
+    p_value   = .x$p_value,
+    n         = .x$n
+  ))
+
+summary_df %>% saveRDS('AIM_RW/scratch/beta_regression/results_summary_by_wetland_type.RDS')
+summary_df %>% write_csv('AIM_RW/scratch/beta_regression/results_summary_by_wetland_type.csv')
+summary_df %>% dplyr::select(predictor, response, pseudo_r2,wetland_type) %>% 
+  pivot_wider(names_from = wetland_type, values_from = pseudo_r2) %>% 
+ # dplyr::select(predictor,all_of(condition_indicators[-5]), all_of(cover_indicators)) %>% 
+  write_csv('AIM_RW/scratch/beta_regression/results_summary_wide_by_wetland_type.csv')
+  
+# Example: How to create combined plots for the same response variable
+# with different predictors on the same scale
+predictor1='s2_jas_ndvi_median'
+create_combined_plot_wet <- function(results_list, response_var, predictor1, wetland_type_1, wetland_type_2) {
+
+  
+  # Extract relevant results
+  result1 <- results_list %>% keep(~ .x$response == response_var & .x$predictor == predictor1 & .x$wetland_type == wetland_type_1) %>% .[[1]]
+  result2 <- results_list %>% keep(~ .x$response == response_var & .x$predictor == predictor1 & .x$wetland_type == wetland_type_2) %>% .[[1]]
+  
+  if(is.null(result1) || is.null(result2)) {
+    stop("One or both predictor-response combinations not found in results")
+  }
+  
+  # Combine plot data with pseudo R² info
+  combined_plot_data <- bind_rows(
+    result1$plot_data %>% mutate(model = paste0("Wetland Type 1: ", wetland_type_1, " (R² = ", round(result1$pseudo_r2, 3), ")")),
+    result2$plot_data %>% mutate(model = paste0("Wetland Type 2: ", wetland_type_2, " (R² = ", round(result2$pseudo_r2, 3), ")"))
+  )
+  
+  # Combine observed data with pseudo R² info
+  combined_obs_data <- bind_rows(
+    result1$observed_data %>% mutate(model = paste0("Wetland Type 1: ", wetland_type_1, " (R² = ", round(result1$pseudo_r2, 3), ")")),
+    result2$observed_data %>% mutate(model = paste0("Wetland Type 2: ", wetland_type_2, " (R² = ", round(result2$pseudo_r2, 3), ")"))
+  )
+  
+  # Determine which model has better fit
+  better_model <- ifelse(result1$pseudo_r2 > result2$pseudo_r2, predictor1, predictor2)
+  better_r2 <- max(result1$pseudo_r2, result2$pseudo_r2)
+  
+  # Create combined plot
+  ggplot() +
+    geom_point(data = combined_obs_data, 
+               aes(x = predictor_value, y = observed_value, color = model), 
+               alpha = 0.6) +
+    geom_line(data = combined_plot_data, 
+              aes(x = predictor_value, y = fitted, color = model), 
+              size = 1) +
+    geom_ribbon(data = combined_plot_data, 
+                aes(x = predictor_value, ymin = lower_ci, ymax = upper_ci, fill = model),
+                alpha = 0.2) +
+    labs(
+      title = paste("Comparison of predictors for", response_var, ' in ',wetland_type),
+      subtitle = paste("Best model:", better_model, "with Pseudo R² =", round(better_r2, 3)),
+      x = "Predictor Value",
+      y = response_var,
+      color = "Model",
+    ) +
+    theme_minimal() +
+    theme(legend.position = "bottom",
+          legend.title = element_text(size = 10),
+          legend.text = element_text(size = 9))+
+    scale_color_few()+
+    scale_fill_few(guide='none')
+}
+unique(dat_lng_joined$rs_metric)
+unique(dat_lng_joined$field_indicators)
+combined_plot
+
+AH_HydroWithFACCover <- create_combined_plot(successes, "AH_HydroWithFACCover","LS_jas_rri-speirsq-5yr_annual_mean", "LS_jas_rri-prrsq-5yr_annual_mean")
+
+```
+
+
+## S2 point vs S2 polygon 
+
+
+### Analysis of Raw Data
+
+```{r}
+library(hrbrthemes)
+
+dat_wide_joined_abv10 <- dat_wide_joined  %>%  filter(AvgWidthArea_1>10) %>% 
+  dplyr::select(EvaluationID, AvgWidthArea_1, s2_jas_ndvi_median_PTS,s2_jas_ndvi_median,s2_jas_ndvi_median_p10, s2_jas_ndvi_median_p90)
+
+p_1<- dat_wide_joined_abv10 %>% 
+  ggplot(aes(s2_jas_ndvi_median, s2_jas_ndvi_median_PTS)) +
+  geom_point(shape=21, alpha=0.5,aes(size=AvgWidthArea_1, fill=AvgWidthArea_1)) +
+  stat_cor(method='spearman',cor.coef.name='rho') +
+  geom_abline() +
+  geom_smooth() +
+  theme_minimal() +
+  scale_fill_viridis_c() +
+  labs(
+    x='Polygon Median NDVI', 
+    y='Plot Center NDVI', 
+    title='S2 JAS NDVI: Polygon Median vs. Plot Center'
+  ) +
+  guides(
+    fill = guide_legend(title = "Plot Width (m)", override.aes = list(alpha = 1)),
+    size = guide_legend(title = "Plot Width (m)", override.aes = list(alpha = 1))
+  )+
+  theme( plot.title = element_text(hjust = 0.5))
+
+
+p_2<- dat_wide_joined_abv10 %>% 
+  ggplot(aes(s2_jas_ndvi_median_p10, s2_jas_ndvi_median_p90)) +
+  geom_point(shape=21, alpha=0.5,aes(size=AvgWidthArea_1, fill=AvgWidthArea_1)) +
+  stat_cor(method='spearman',cor.coef.name='rho') +
+  geom_abline() +
+  geom_smooth() +
+  theme_minimal() +
+  scale_fill_viridis_c() +
+  labs(
+    x='10th Percentile NDVI', 
+    y='90th Percentile NDVI', 
+    title='S2 JAS NDVI: Polygon 10th vs. 90th Percentile'
+  ) +
+  guides(
+    fill = guide_legend(title = "Plot Width (m)", override.aes = list(alpha = 1)),
+    size = guide_legend(title = "Plot Width (m)", override.aes = list(alpha = 1))
+  )+
+  theme( plot.title = element_text(hjust = 0.5))
+
+
+p<- p_1 / p_2 + plot_layout(guides = 'collect')
+
+p %>% ggsave('AIM_RW/figures/s2_jas_ndvi_footprint_scatter.png',.,width=6,height=8,bg = 'white')
+
+dat_wide_joined_abv10 %>% 
+  ggplot(aes(s2_jas_ndvi_median_PTS,s2_jas_ndvi_median_p90,size=AvgWidthArea_1 , fill=AvgWidthArea_1))+geom_point(shape=21, alpha=0.5)+
+  stat_cor()+geom_abline()+geom_smooth()+theme_minimal()+
+  scale_fill_viridis_c()
+
+# Prepare the data - arrange by s2_jas_ndvi_median and create ordered factor
+plot_data <- dat_wide_joined_abv10 %>%
+ # filter(AvgWidthArea_1<30) %>% 
+  mutate(EvaluationID = fct_reorder(EvaluationID, s2_jas_ndvi_median))
+
+# Create the plot
+p <- ggplot(plot_data, aes(x = EvaluationID)) +
+  # Add error bars (p10 to p90 range)
+  geom_segment(aes(y = s2_jas_ndvi_median_p10, 
+                   yend = s2_jas_ndvi_median_p90,
+                   xend = EvaluationID),
+               color = "gray60", size = 1) +
+  
+  # Add median points
+  geom_point(aes(y = s2_jas_ndvi_median, fill = "Polygon Median"), 
+             size = 1,shape=21,alpha=0.9) +
+  
+  # Add PTS points  
+  geom_point(aes(y = s2_jas_ndvi_median_PTS, fill = "Plot Center"), 
+             size = 1,shape=21,alpha=0.9) +
+  
+  geom_smooth(aes(y = s2_jas_ndvi_median_PTS, 
+                x = as.numeric(EvaluationID),
+                color = "Plot Center"),
+            method = "loess", 
+            se = TRUE,  # or FALSE if you don't want confidence band
+            linewidth = 1,
+            span = 0.5,color="#FF8C00")+
+  
+  # Customize colors
+  scale_fill_manual(values = c("Polygon Median" = "#2E8B57",     # Sea green
+                                "Plot Center" = "#FF8C00")) +
+  
+  # Labels and theme
+  labs(
+    title = "S2 JAS NDVI by Evaluation ID",
+    subtitle = "Sites ordered by NDVI polygon median (lowest to highest).\nGray lines show range from 10th to 90th percentile values for polygon footprint",
+    x = "Plots",
+    y = "NDVI",
+    fill = "Spatial Footprint"
+  ) +
+  
+  theme_few() +
+  theme(
+    axis.text.x = element_blank(),
+    plot.title = element_text(hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5),
+    legend.position= c(.9,.15),
+  )+
+  scale_y_continuous(breaks=c(0,.25,.5,.75,1))
+
+# Display the plot
+p %>% ggsave('AIM_RW/figures/s2_pt_vs_polygon_all_plots.png',.,width=9,height=5,bg = 'white')
+```
+
+
+```{r}
+
+
+TotalFoliarCover <- create_combined_plot(successes, "TotalFoliarCover","s2_jas_ndvi_median_PTS", "s2_jas_ndvi_median")
+AH_HydroWithFACCover <- create_combined_plot(successes, "AH_HydroWithFACCover","s2_jas_ndvi_median_PTS", "s2_jas_ndvi_median")
+AH_HydroNoFACCover <- create_combined_plot(successes, "AH_HydroNoFACCover","s2_jas_ndvi_median_PTS", "s2_jas_ndvi_median")
+BareSoilCover <- create_combined_plot(successes, "BareSoilCover","s2_jas_ndvi_median_PTS", "s2_jas_ndvi_median")
+
+p<- TotalFoliarCover +AH_HydroWithFACCover+AH_HydroNoFACCover+BareSoilCover
+p %>% ggsave('AIM_RW/figures/beta_reg/pts_vs_polygons.png',.,width=16,height=12,bg = 'white')
+
+p <- AH_HydroWithFACCover
+p %>% ggsave('AIM_RW/figures/beta_reg/pts_vs_polygons_hydroWithFAC.png',.,width=8,height=6,bg = 'white')
+
+
+
+ p_scatter<- dat_wide_joined %>% 
+  filter(AvgWidthArea_1>10) %>% 
+   ggplot(aes(s2_jas_ndvi_median,s2_jas_ndvi_median_PTS))+geom_point()+geom_abline()+theme_minimal()+geom_smooth()+stat_cor(method='spearman',  cor.coef.name ='rho')
+
+ p_scatter %>% ggsave('AIM_RW/figures/beta_reg/pts_vs_polygons_scatter.png',.,width=8,height=6,bg = 'white')
+ 
+```
+
+## LS polygon vs S2 polygon (JAS)
+
+```{r}
+dat <-  dat_wide_joined  %>%  filter(AvgWidthArea_1>10) %>% 
+  dplyr::select(EvaluationID, AvgWidthArea_1, ,s2_jas_ndvi_median,LS_jas_ndvi_median)
+
+
+p_1<- dat %>% 
+  ggplot(aes(s2_jas_ndvi_median, LS_jas_ndvi_median)) +
+  geom_point(shape=21, alpha=0.5,aes(size=AvgWidthArea_1, fill=AvgWidthArea_1)) +
+  stat_cor(method='spearman',cor.coef.name='rho') +
+  geom_abline() +
+  geom_smooth() +
+  theme_minimal() +
+  scale_fill_viridis_c() +
+  labs(
+    x='S2 JAS NDVI', 
+    y='LS JAS NDVI', 
+    title='Polygon Median JAS NDVI: Sentinel 2 (S2) vs Landsat (LS)'
+  ) +
+  guides(
+    fill = guide_legend(title = "Plot Width (m)", override.aes = list(alpha = 1)),
+    size = guide_legend(title = "Plot Width (m)", override.aes = list(alpha = 1))
+  )+
+  theme( plot.title = element_text(hjust = 0.5))+
+  coord_cartesian(xlim=c(0.1,.9),ylim=c(0.1,.9))
+
+p_1 %>% ggsave('AIM_RW/figures/s2_vs_ls_jas_ndvi_scatter.png',.,width=8,height=6,bg = 'white')
+
+dat <-  dat_wide_joined  %>%  filter(AvgWidthArea_1>10) %>% 
+  dplyr::select(EvaluationID, AvgWidthArea_1, ,s2_amj_ndvi_median,LS_amj_ndvi_median)
+
+p_1<- dat %>% 
+  ggplot(aes(s2_amj_ndvi_median, LS_amj_ndvi_median)) +
+  geom_point(shape=21, alpha=0.5,aes(size=AvgWidthArea_1, fill=AvgWidthArea_1)) +
+  stat_cor(method='spearman',cor.coef.name='rho') +
+  geom_abline() +
+  geom_smooth() +
+  theme_minimal() +
+  scale_fill_viridis_c() +
+  labs(
+    x='S2 JAS NDVI', 
+    y='LS JAS NDVI', 
+    title='Polygon Median JAS NDVI: Sentinel 2 (S2) vs Landsat (LS)'
+  ) +
+  guides(
+    fill = guide_legend(title = "Plot Width (m)", override.aes = list(alpha = 1)),
+    size = guide_legend(title = "Plot Width (m)", override.aes = list(alpha = 1))
+  )+
+  theme( plot.title = element_text(hjust = 0.5))+
+  coord_cartesian(xlim=c(0.1,.9),ylim=c(0.1,.9))
+
+p_1
+```
+
+
+```{r}
+TotalFoliarCover <- create_combined_plot(successes, "TotalFoliarCover","LS_jas_ndvi_median", "s2_jas_ndvi_median")
+AH_HydroWithFACCover <- create_combined_plot(successes, "AH_HydroWithFACCover","LS_jas_ndvi_median", "s2_jas_ndvi_median")
+AH_HydroNoFACCover <- create_combined_plot(successes, "AH_HydroNoFACCover","LS_jas_ndvi_median", "s2_jas_ndvi_median")
+BareSoilCover <- create_combined_plot(successes, "BareSoilCover","LS_jas_ndvi_median", "s2_jas_ndvi_median")
+
+p <- AH_HydroWithFACCover
+p %>% ggsave('AIM_RW/figures/beta_reg/s2_vs_ls_hydroWithFAC.png',.,width=8,height=6,bg = 'white')
+
+
+
+p<- TotalFoliarCover +AH_HydroWithFACCover+AH_HydroNoFACCover+BareSoilCover
+p %>% ggsave('AIM_RW/figures/beta_reg/landsat_vs_s2.png',.,width=16,height=12,bg = 'white')
+
+ p_scatter<- dat_wide_joined %>% 
+  filter(AvgWidthArea_1>10) %>% 
+   ggplot(aes(s2_jas_ndvi_median,LS_jas_ndvi_median))+geom_point()+geom_abline()+theme_minimal()+geom_smooth()+stat_cor(method='spearman',  cor.coef.name ='rho')
+
+ p_scatter %>% ggsave('AIM_RW/figures/beta_reg/landsat_vs_s2_scatter.png',.,width=8,height=6,bg = 'white')
+ 
+```
+
+## LS polygon vs S2 polygon (AMJ)
+
+```{r}
+TotalFoliarCover <- create_combined_plot(successes, "TotalFoliarCover","LS_amj_ndvi_median", "s2_amj_ndvi_median")
+AH_HydroWithFACCover <- create_combined_plot(successes, "AH_HydroWithFACCover","LS_amj_ndvi_median", "s2_amj_ndvi_median")
+AH_HydroNoFACCover <- create_combined_plot(successes, "AH_HydroNoFACCover","LS_amj_ndvi_median", "s2_amj_ndvi_median")
+BareSoilCover <- create_combined_plot(successes, "BareSoilCover","LS_amj_ndvi_median", "s2_amj_ndvi_median")
+
+p<- TotalFoliarCover +AH_HydroWithFACCover+AH_HydroNoFACCover+BareSoilCover
+p %>% ggsave('AIM_RW/figures/beta_reg/landsat_vs_s2_amj.png',.,width=16,height=12,bg = 'white')
+
+ p_scatter<- dat_wide_joined %>% 
+  filter(AvgWidthArea_1>10) %>% 
+   ggplot(aes(s2_amj_ndvi_median,LS_amj_ndvi_median))+geom_point()+geom_abline()+theme_minimal()+
+   geom_smooth(span=2)+
+   geom_smooth(method='lm',color='red')+
+   stat_cor(method='spearman',  cor.coef.name ='rho')
+
+ p_scatter %>% ggsave('AIM_RW/figures/beta_reg/landsat_vs_s2_amj_scatter.png',.,width=8,height=6,bg = 'white')
+ 
+```
+
+
+## MRRMAID metrics
+
+```{r}
+
+successes <-  readRDS('AIM_RW/scratch/beta_regression/results_list.RDS')
+
+
+TotalFoliarCover <- create_combined_plot(successes, "TotalFoliarCover","S2_monthly_MRRMAID-FieldMth-Mesic_NApctArea", "s2_jas_ndvi_median")
+AH_HydroWithFACCover <- create_combined_plot(successes, "AH_HydroWithFACCover","S2_jas_MRRMAID-MesicmeanpctArea", "s2_jas_ndvi_median")
+AH_HydroNoFACCover <- create_combined_plot(successes, "AH_HydroNoFACCover","S2_jas_MRRMAID-MesicmeanpctArea", "s2_jas_ndvi_median")
+BareSoilCover <- create_combined_plot(successes, "BareSoilCover","S2_jas_MRRMAID-MesicmeanpctArea", "s2_jas_ndvi_median")
+
+p<- TotalFoliarCover +AH_HydroWithFACCover+AH_HydroNoFACCover+BareSoilCover
+p %>% ggsave('AIM_RW/figures/beta_reg/s2_jas_vMRRMAID.png',.,width=16,height=12,bg = 'white')
+
+ p_scatter<- dat_wide_joined %>% 
+  filter(AvgWidthArea_1>10) %>% 
+   ggplot(aes(s2_jas_ndvi_median,`S2_jas_MRRMAID-MesicmeanpctArea`))+geom_point()+geom_abline()+theme_minimal()+
+   geom_smooth(span=1)+
+   geom_smooth(method='lm',color='red')+
+   stat_cor(method='spearman',  cor.coef.name ='rho')
+
+ p_scatter %>% ggsave('AIM_RW/figures/beta_reg/s2_jas_vMRRMAID_scatter.png',.,width=8,height=6,bg = 'white')
+ 
+
+TotalFoliarCover <- create_combined_plot(successes, "TotalFoliarCover","S2_jas_MRRMAID-MesicmeanpctArea", "s2_jas_ndvi_median")
+AH_HydroWithFACCover <- create_combined_plot(successes, "AH_HydroWithFACCover","S2_jas_MRRMAID-MesicmeanpctArea", "s2_jas_ndvi_median")
+AH_HydroNoFACCover <- create_combined_plot(successes, "AH_HydroNoFACCover","S2_jas_MRRMAID-MesicmeanpctArea", "s2_jas_ndvi_median")
+BareSoilCover <- create_combined_plot(successes, "BareSoilCover","S2_jas_MRRMAID-MesicmeanpctArea", "s2_jas_ndvi_median")
+
+p<- TotalFoliarCover +AH_HydroWithFACCover+AH_HydroNoFACCover+BareSoilCover
+p %>% ggsave('AIM_RW/figures/beta_reg/s2_jas_vMVP.png',.,width=16,height=12,bg = 'white')
+
+ p_scatter<- dat_wide_joined %>% 
+  filter(AvgWidthArea_1>10) %>% 
+   ggplot(aes(s2_jas_ndvi_median,`S2_mjjasMVP-m0.2-mci0.3_mean_mean`))+geom_point()+geom_abline()+theme_minimal()+
+   geom_smooth(span=2)+
+   geom_smooth(method='lm',color='red')+
+   stat_cor(method='spearman',  cor.coef.name ='rho')
+
+ p_scatter %>% ggsave('AIM_RW/figures/beta_reg/s2_jas_vMVP_scatter.png',.,width=8,height=6,bg = 'white')
+ 
+ 
+```
+
+
+# Wetland Type
+
+```{r}
+# Save results with plot data
+successes_wet <-  readRDS('AIM_RW/scratch/beta_regression/results_list_by_wetType.RDS')
+AH_HydroWithFACCover <- create_combined_plot_wet(successes_wet, response_var = "AH_HydroWithFACCover",predictor1 = "s2_jas_ndvi_median", wetland_type_1 = "Vegetated Drainageway" ,wetland_type_2= "Wet or Mesic Meadow")
+
+AH_HydroWithFACCover%>% ggsave('AIM_RW/figures/beta_reg/s2_ndvi_jas_vegDrain_meadow_scatter.png',.,width=8,height=6,bg = 'white')
+
+
+AH_HydroWithFACCover <- create_combined_plot_wet(successes_wet, response_var = "AH_HydroWithFACCover",predictor1 = "s2_jas_ndvi_median", wetland_type_1 = "Riparian Shrubland or Shrub Wetland" ,wetland_type_2= "Spring or Seep")
+
+AH_HydroWithFACCover%>% ggsave('AIM_RW/figures/beta_reg/s2_ndvi_jas_spring_rip_scatter.png',.,width=8,height=6,bg = 'white')
+
+
+results_list=successes_wet
+create_combined_plot_wet()
+AH_HydroWithFACCover%>% ggsave('AIM_RW/figures/beta_reg/s2_ndvi_jas_vegDrain_meadow_scatter.png',.,width=8,height=6,bg = 'white')
+```
+
+
+# Climate Sensitivity
+
+```{r}
+p_scatter<- dat_wide_joined %>% 
+  filter(AvgWidthArea_1>10) %>% 
+  dplyr::select(EvaluationID, AvgWidthArea_1, ,s2_jas_ndvi_median,`LS_jas_rri-speislope-5yr_annual_mean`,`LS_jas_rri-speirsq-5yr_annual_mean`,
+                `LS_jas_rri-speislope-10yr_annual_mean`,`LS_jas_rri-speirsq-10yr_annual_mean`,
+                WetlandType,AH_HydroWithFACCover) %>% 
+    mutate(WetlandType = ifelse(WetlandType == 'Riparian Shrubland', 'Riparian Shrubland or Shrub Wetland',WetlandType ))
+
+p_scatter %>% 
+  ggplot(aes(s2_jas_ndvi_median, `LS_jas_rri-speislope-5yr_annual_mean`))+
+  geom_point(aes(size= AH_HydroWithFACCover, fill=AH_HydroWithFACCover), shape=21, alpha=0.7)+
+  scale_fill_viridis_c()+
+  stat_cor()+
+  facet_wrap(~WetlandType)
+
+p_scatter %>% 
+  ggplot(aes(s2_jas_ndvi_median, AH_HydroWithFACCover))+
+  geom_point(aes(size= AH_HydroWithFACCover, fill=AH_HydroWithFACCover), shape=21, alpha=0.7)+
+  scale_fill_viridis_c()+
+  stat_cor()+
+  facet_wrap(~WetlandType)
+
+p1<- p_scatter %>% 
+#  filter(WetlandType!='Fen or Bog') %>% 
+  filter(WetlandType!='Fen or Bog') %>% 
+  ggplot(aes(s2_jas_ndvi_median, `LS_jas_rri-speirsq-10yr_annual_mean`)) +
+  geom_point(aes(fill = WetlandType), shape = 21, alpha = 0.6) +
+  stat_ellipse(aes(fill = WetlandType, color=WetlandType), level = 0.90, alpha = 0.2, geom = "polygon") +
+  scale_fill_ptol()+
+    scale_color_ptol()+
+  #geom_smooth(se=FALSE,method='lm')+
+  #scale_fill_viridis_d() +
+  #scale_color_viridis_d() +
+  stat_cor(method='spearman',  cor.coef.name = c("rho")) +
+  theme_minimal()+
+  labs(x='S2 JAS NDVI',y='10-yr JAS NDVI-SPEI R^2')#+
+  facet_wrap(~WetlandType)
+
+p1 %>% ggsave('AIM_RW/figures/wetland_types/s2_ndvi_vs_rri_all.png',.,width=10,height=5,bg = 'white')
+
+p2<- p_scatter %>% 
+#  filter(WetlandType!='Fen or Bog') %>% 
+  filter(WetlandType!='Fen or Bog') %>% 
+  ggplot(aes(s2_jas_ndvi_median, `LS_jas_rri-speirsq-10yr_annual_mean`)) +
+  geom_point(aes(fill = WetlandType), shape = 21, alpha = 0.6) +
+  stat_ellipse(aes(fill = WetlandType, color=WetlandType), level = 0.90, alpha = 0.2, geom = "polygon") +
+  scale_fill_ptol()+
+    scale_color_ptol()+
+  #geom_smooth(se=FALSE,method='lm')+
+  #scale_fill_viridis_d() +
+  #scale_color_viridis_d() +
+  stat_cor(method='spearman',  cor.coef.name = c("rho")) +
+  theme_minimal()+
+  labs(x='S2 JAS NDVI',y='10-yr JAS NDVI-SPEI R^2')+
+  facet_wrap(~WetlandType)
+
+p2 %>% ggsave('AIM_RW/figures/wetland_types/s2_ndvi_vs_rri_faceted.png',.,width=10,height=7,bg = 'white')
+
+
+p_scatter %>% 
+  mutate(AH_HydroWithFACCover_bin = 
+           case_when(
+             AH_HydroWithFACCover<25 ~ '<25%',
+             AH_HydroWithFACCover>= 25 & AH_HydroWithFACCover< 50 ~ '25-50%',
+             AH_HydroWithFACCover>= 50 & AH_HydroWithFACCover< 75 ~ '50-75',
+             AH_HydroWithFACCover>75 ~ '>75%',
+           )) %>% 
+  filter(WetlandType!='Fen or Bog') %>% 
+  ggplot(aes(s2_jas_ndvi_median, `LS_jas_rri-speirsq-5yr_annual_mean`)) +
+  geom_point(aes(fill = AH_HydroWithFACCover_bin), shape = 21, alpha = 0.6) +
+  stat_ellipse(aes(fill = AH_HydroWithFACCover_bin, color=AH_HydroWithFACCover_bin), level = 0.90, alpha = 0.2, geom = "polygon") +
+  scale_fill_ptol()+
+    scale_color_ptol()+
+  #scale_fill_viridis_d() +
+  #scale_color_viridis_d() +
+  stat_cor() +
+  theme_minimal()+
+  facet_wrap(~WetlandType)
+
+
+p_scatter<- dat_wide_joined %>% 
+  filter(AvgWidthArea_1>10) %>% 
+  dplyr::select(EvaluationID, AvgWidthArea_1, ,s2_jas_ndvi_median,`LS_jas_rri-speislope-5yr_annual_mean`,`LS_jas_rri-speirsq-5yr_annual_mean`,
+                `LS_jas_rri-speislope-10yr_annual_mean`,`LS_jas_rri-speirsq-10yr_annual_mean`,
+                WetlandType,AH_HydroWithFACCover) %>% 
+    mutate(WetlandType = ifelse(WetlandType == 'Riparian Shrubland', 'Riparian Shrubland or Shrub Wetland',WetlandType ))
+
+p_scatter %>% 
+    filter(WetlandType == 'Riparian Shrubland or Shrub Wetland') %>% 
+      ggplot(aes(s2_jas_ndvi_median, `LS_jas_rri-speirsq-10yr_annual_mean`)) +
+      geom_point(aes(fill = AH_HydroWithFACCover), shape = 21, size=4,alpha = 0.6) +
+      geom_smooth(method='lm')+
+    #  stat_ellipse(aes(fill = AH_HydroWithFACCover, color=AH_HydroWithFACCover), level = 0.90, alpha = 0.2, geom = "polygon") +
+      scale_fill_viridis_c()+
+      scale_color_viridis_c()+
+      #scale_fill_viridis_d() +
+      #scale_color_viridis_d() +
+      stat_cor() +
+      theme_minimal()+
+      facet_wrap(~WetlandType)
+
+dat_wide_joined %>% 
+  filter(AvgWidthArea_1>10) %>% 
+ # filter(WetlandType == 'Riparian Shrubland or Shrub Wetland') %>% 
+  dplyr::select(EvaluationID, AvgWidthArea_1, ,s2_jas_ndvi_median,`LS_jas_rri-speislope-5yr_annual_mean`,`LS_jas_rri-speirsq-5yr_annual_mean`,
+                `LS_jas_rri-speislope-10yr_annual_mean`,`LS_jas_rri-speirsq-10yr_annual_mean`,
+                WetlandType,AH_HydroWithFACCover) %>% 
+  lm(data=., AH_HydroWithFACCover ~ s2_jas_ndvi_median *`LS_jas_rri-speirsq-10yr_annual_mean`) %>% 
+#  lm(data=., AH_HydroWithFACCover ~ WetlandType +  s2_jas_ndvi_median +`LS_jas_rri-speirsq-10yr_annual_mean`) %>% 
+  summary(.)
+
+```
+
+
+
+# Classification approach
+
+```{r}
+
+dat_wide_joined %>% 
+  filter(AvgWidthArea_1>10) %>% 
+  mutate(
+    ndvi_bin_0.3 = ifelse(s2_jas_ndvi_median> 0.3, 'High', 'Low'),
+    ndvi_bin_0.4 = ifelse(s2_jas_ndvi_median> 0.4, 'High', 'Low'),
+    ndvi_bin_0.5 = ifelse(s2_jas_ndvi_median> 0.5, 'High', 'Low')
+  )
+
+
+data<- dat_wide_joined %>% 
+  filter(AvgWidthArea_1>10) %>% 
+  #ilter(name == 'AH_HydroNoFACCover') %>% 
+  dplyr::select(EvaluationID,WetlandType,field_indicator =AH_HydroWithFACCover, ndvi = `S2_jas_MRRMAID-MesicmeanpctArea` )
+
+
+# Simplified NDVI Threshold Classification Analysis
+# Tests NDVI thresholds to predict field indicator classifications
+
+
+# Functionalized Threshold Analysis using Youden's J
+library(ggplot2)
+library(dplyr)
+library(purrr)
+library(pROC)
+
+# Main analysis function
+analyze_thresholds <- function(data, field_indicators, rs_indicators, field_thresholds = c(50, 75)) {
+  
+  # Helper function to find optimal threshold for one combination
+  find_optimal <- function(data, field_col, rs_col, field_thresh) {
+    field_binary <- ifelse(data[[field_col]] > field_thresh, 1, 0)
+    roc_obj <- roc(field_binary, data[[rs_col]], quiet = TRUE)
+    
+    roc_data <- data.frame(
+      sensitivity = roc_obj$sensitivities,
+      specificity = roc_obj$specificities,
+      threshold = roc_obj$thresholds
+    )
+    
+    roc_data$youden_j <- roc_data$sensitivity + roc_data$specificity - 1
+    optimal_idx <- which.max(roc_data$youden_j)
+    
+    return(data.frame(
+      field_indicator = field_col,
+      rs_indicator = rs_col,
+      field_threshold = field_thresh,
+      optimal_rs_threshold = roc_data$threshold[optimal_idx],
+      sensitivity = roc_data$sensitivity[optimal_idx],
+      specificity = roc_data$specificity[optimal_idx],
+      youden_j = roc_data$youden_j[optimal_idx],
+      auc = as.numeric(auc(roc_obj))
+    ))
+  }
+  
+  # Generate all combinations and calculate optimal thresholds
+  combinations <- expand.grid(
+    field_indicator = field_indicators,
+    rs_indicator = rs_indicators,
+    field_threshold = field_thresholds,
+    stringsAsFactors = FALSE
+  )
+  
+  results <- pmap_dfr(combinations, function(field_indicator, rs_indicator, field_threshold) {
+    find_optimal(data, field_indicator, rs_indicator, field_threshold)
+  })
+  
+  return(results)
+}
+
+# Function to create classification and plots
+create_classification_plots <- function(data, results) {
+  
+  plots_list <- list()
+  
+  for(i in 1:nrow(results)) {
+    # Extract parameters for this combination
+    field_col <- results$field_indicator[i]
+    rs_col <- results$rs_indicator[i]
+    field_thresh <- results$field_threshold[i]
+    rs_thresh <- results$optimal_rs_threshold[i]
+    
+    # Classify points
+    plot_data <- data %>%
+      mutate(
+        result = case_when(
+          .data[[rs_col]] >= rs_thresh & .data[[field_col]] >= field_thresh ~ 'TP',
+          .data[[rs_col]] < rs_thresh & .data[[field_col]] >= field_thresh ~ 'FN',
+          .data[[rs_col]] < rs_thresh & .data[[field_col]] < field_thresh ~ 'TN',
+          .data[[rs_col]] >= rs_thresh & .data[[field_col]] < field_thresh ~ 'FP'
+        )
+      )
+    
+    plot_title <- sprintf("%s vs %s (Field: >%d%%)", rs_col, field_col, field_thresh)
+    
+    # All data plot
+    p_all <- ggplot(plot_data, aes_string(x = rs_col, y = field_col, color = "result")) +
+      geom_point(alpha = 0.7) +
+      geom_hline(yintercept = field_thresh, linetype = "dashed") +
+      geom_vline(xintercept = rs_thresh, linetype = "dashed") +
+      scale_color_manual(values = c("TP" = "#2E8B57", "TN" = "#4169E1", 
+                                   "FP" = "#FF6347", "FN" = "#FFD700")) +
+      labs(title = paste("All Data:", plot_title),
+           subtitle = sprintf("Overall Sens: %.3f, Spec: %.3f, Optimal Threshold: %.3f", 
+                            results$sensitivity[i], results$specificity[i], results$optimal_rs_threshold[i])) +
+      theme_minimal() +
+      theme(legend.position = "bottom")
+    
+    # Faceted plot by WetlandType
+    p_facet <- ggplot(plot_data, aes_string(x = rs_col, y = field_col, color = "result")) +
+      geom_point(alpha = 0.7) +
+      geom_hline(yintercept = field_thresh, linetype = "dashed") +
+      geom_vline(xintercept = rs_thresh, linetype = "dashed") +
+      facet_wrap(~WetlandType) +
+      scale_color_manual(values = c("TP" = "#2E8B57", "TN" = "#4169E1", 
+                                   "FP" = "#FF6347", "FN" = "#FFD700")) +
+      labs(title = paste("By Wetland Type:", plot_title),
+           subtitle = sprintf("Overall Sens: %.3f, Spec: %.3f, Optimal Threshold: %.3f", 
+                            results$sensitivity[i], results$specificity[i], results$optimal_rs_threshold[i])) +
+      theme_minimal() +
+      theme(legend.position = "bottom")
+    
+    plots_list[[paste0("all_", i)]] <- p_all
+    plots_list[[paste0("faceted_", i)]] <- p_facet
+  }
+  
+  return(plots_list)
+}
+
+# Usage example with your data structure:
+data <- dat_wide_joined %>% 
+  filter(AvgWidthArea_1 > 10) %>% 
+  dplyr::select(
+    EvaluationID, WetlandType, AH_HydroWithFACCover, AH_HydroNoFACCover, s2_jas_ndvi_median,s2_jas_ndvi_median_p90,
+         S2_jas_ndvi_median_pctarea_gt0.4= `S2_jas_ndvi_median_pctarea-gt0.4`,
+    S2_jas_MRRMAID_MesicmeanpctArea=`S2_jas_MRRMAID-MesicmeanpctArea`,
+    S2_jasMVP_m0.2_mci0.3_mean_mean=`S2_jasMVP-m0.2-mci0.3_mean_mean`) %>%         # remote sensing indicator
+  mutate(WetlandType = ifelse(WetlandType == 'Riparian Shrubland', 'Riparian Shrubland or Shrub Wetland',WetlandType ))
+
+# Define your indicators
+field_indicators <- c("AH_HydroWithFACCover", "AH_HydroNoFACCover")
+rs_indicators <- c("s2_jas_ndvi_median", "s2_jas_ndvi_median_p90", "S2_jas_ndvi_median_pctarea_gt0.4",
+                   "S2_jas_MRRMAID_MesicmeanpctArea","S2_jasMVP_m0.2_mci0.3_mean_mean")
+
+# Run analysis
+optimal_results <- analyze_thresholds(data, field_indicators, rs_indicators, c(50, 75))
+
+optimal_results %>% write_csv('AIM_RW/scratch/classification/optimal_results.csv')
+
+optimal_results %>% saveRDS('AIM_RW/scratch/classification/optimal_results.RDS')
+
+optimal_results %>% 
+  ggplot(aes(rs_indicator, specificity))+geom_point()+
+  facet_grid(cols=vars(field_threshold), rows=vars(field_indicator))+
+  theme(axis.text.x = element_text(angle = 90,vjust=0.5))
+
+# Print results summary
+print("=== OPTIMAL THRESHOLDS SUMMARY ===")
+print(optimal_results)
+
+# Create plots
+plots <- create_classification_plots(data, optimal_results)
+
+# Display plots (example for first combination)
+print(plots$all_1)      # All data plot
+print(plots$faceted_1)  # Faceted plot
+
+# Function to export plots with distinct names
+export_plots <- function(plots_list, results, 
+                        output_dir = "AIM_RW/figures/classification", 
+                        file_format = "png", 
+                        width = 10, 
+                        height = 8, 
+                        dpi = 300) {
+  
+  # Create output directory if it doesn't exist
+  if (!dir.exists(output_dir)) {
+    dir.create(output_dir, recursive = TRUE)
+  }
+  
+  # Helper function to clean names for filenames
+  clean_name <- function(name) {
+    # Replace special characters with underscores and remove extra spaces
+    name <- gsub("[^A-Za-z0-9._-]", "_", name)
+    name <- gsub("_{2,}", "_", name)  # Replace multiple underscores with single
+    name <- gsub("^_|_$", "", name)   # Remove leading/trailing underscores
+    return(name)
+  }
+  
+  # Export each plot
+  for(i in 1:nrow(results)) {
+    
+    # Get plot parameters
+    field_indicator <- clean_name(results$field_indicator[i])
+    rs_indicator <- clean_name(results$rs_indicator[i])
+    field_threshold <- results$field_threshold[i]
+    
+    # Create base filename
+    base_name <- sprintf("%s_vs_%s_thresh%d", 
+                        rs_indicator, 
+                        field_indicator, 
+                        field_threshold)
+    
+    # Export "all data" plot
+    all_plot_name <- paste0("all_", i)
+    if (all_plot_name %in% names(plots_list)) {
+      filename_all <- file.path(output_dir, 
+                               paste0(base_name, "_all_data.", file_format))
+      
+      ggsave(filename = filename_all, 
+             plot = plots_list[[all_plot_name]], 
+             width = width, 
+             height = height, 
+             dpi = dpi, bg='white')
+      
+      cat("Saved:", filename_all, "\n")
+    }
+    
+    # Export "faceted" plot
+    faceted_plot_name <- paste0("faceted_", i)
+    if (faceted_plot_name %in% names(plots_list)) {
+      filename_faceted <- file.path(output_dir, 
+                                   paste0(base_name, "_by_wetland_type.", file_format))
+      
+      ggsave(filename = filename_faceted, 
+             plot = plots_list[[faceted_plot_name]], 
+             width = width, 
+             height = height, 
+             dpi = dpi, bg='white')
+      
+      cat("Saved:", filename_faceted, "\n")
+    }
+  }
+  
+  cat("\nAll plots exported to:", output_dir, "\n")
+  
+  # Return summary of exported files
+  exported_files <- list.files(output_dir, pattern = paste0("\\.", file_format, "$"), full.names = TRUE)
+  return(exported_files)
+}
+
+exported_files <- export_plots(plots, optimal_results)
+# Access all plots:
+# plots$all_1, plots$faceted_1, plots$all_2, plots$faceted_2, etc.
+```
+
+
+
+
+
+```{r}
+
+lm_dat <- dat_wide_joined %>% 
+  filter(AvgWidthArea_1>10)
+library(mgcv)
+gam_model <- gam(AH_HydroWithFACCover ~ s(s2_jas_ndvi_median_p90) +
+                   s(s2_jas_ndvi_median_p10) +
+                   s(MVP)+
+                   s(MRRMAID)+
+                 #  s(`S2_jas_ndvi_median_pctarea-gt0.3`) +
+                  # s(`S2_jasMVP-m0.2-mci0.3_mean_mean`) +
+                 #  s(`S2_jas_MRRMAID-MesicmeanpctArea`) +
+                   s(s2_amj_ndvi_median) +
+                   s(Elevation_m),
+                 data = lm_dat %>% 
+                   rename(MVP = `S2_jasMVP-m0.2-mci0.3_mean_mean`,
+                          MRRMAID=`S2_jas_MRRMAID-MesicmeanpctArea`))
+summary(gam_model)
+```
+
+
+# Multivariate Classification 
+
+```{r}
+# ------------------------------
+# Libraries
+# ------------------------------
+library(dplyr)
+library(purrr)
+library(stringr)
+library(tibble)
+library(tidyr)
+library(glmnet)
+library(rsample)
+library(pROC)
+library(PRROC)
+library(splines)
+
+set.seed(42)
+
+# ------------------------------
+# Hyperparams and seeds
+# ------------------------------
+alpha_grid <- c(0.1, 0.3, 0.5, 0.7, 1.0)
+cv_type_measure <- "auc"  # robust for imbalance
+cv_nfolds <- 10
+cv_seed_base <- 2027      # used to seed each alpha's CV
+
+# ------------------------------
+# Data prep
+# ------------------------------
+mod_dat <- dat_wide_joined %>%
+  dplyr::filter(AvgWidthArea_1 > 10) %>%
+  dplyr::mutate(
+    hydro_FACwet_abv0.5     = as.integer(AH_HydroWithFACCover  > 50),
+    hydro_FACwet_abv0.75    = as.integer(AH_HydroWithFACCover  > 75),
+    hydro_noFACwet_abv0.5   = as.integer(AH_HydroNoFACCover    > 50),
+    hydro_noFACwet_abv0.75  = as.integer(AH_HydroNoFACCover    > 75),
+    s2_ndvi_diff = s2_jas_ndvi_median - s2_amj_ndvi_median
+  )
+
+names(mod_dat) <- stringr::str_replace_all(names(mod_dat), "-", "_")
+mod_dat <- mod_dat %>% dplyr::mutate(.row = dplyr::row_number())
+
+target_cols <- c(
+  "hydro_FACwet_abv0.5",
+  "hydro_FACwet_abv0.75",
+  "hydro_noFACwet_abv0.5",
+  "hydro_noFACwet_abv0.75"
+)
+
+pred_cols <- c(
+  'Elevation_m',
+  "s2_ndvi_diff",
+  "s2_jas_ndvi_median",
+  "s2_jas_ndwi_median",
+  "S2_monthly_MRRMAID_Jun_Mesic_NApctArea",
+  "S2_monthly_MRRMAID_Sep_Mesic_NApctArea",
+  "S2_jas_MRRMAID_WatermeanpctArea",
+  "LS_jas_rri_speislope_10yr_annual_mean",
+  "s2_amj_ndvi_median",
+  "s2_amj_ndwi_median"
+)
+
+nonlinear_vars    <- c('Elevation_m')
+interaction_pairs <- list(
+  c("s2_jas_ndvi_median","LS_jas_rri_speislope_10yr_annual_mean"),
+  c("S2_monthly_MRRMAID_Jun_Mesic_NApctArea","S2_monthly_MRRMAID_Sep_Mesic_NApctArea")
+)
+
+# ------------------------------
+# Helpers
+# ------------------------------
+mk_formula <- function(y, mains, nonlin = NULL, inter_pairs = NULL) {
+  main_terms <- mains
+  nl_terms <- if (!is.null(nonlin) && length(nonlin) > 0) paste0("ns(", nonlin, ", df=3)") else NULL
+  if (!is.null(inter_pairs) && length(inter_pairs) > 0) {
+    inter_pairs <- inter_pairs[purrr::map_lgl(inter_pairs, ~ all(.x %in% mains))]
+  }
+  int_terms <- if (length(inter_pairs) > 0) vapply(inter_pairs, function(p) paste0(p[1], ":", p[2]), character(1)) else NULL
+  rhs <- paste(c(main_terms, nl_terms, int_terms), collapse = " + ")
+  stats::as.formula(paste0(y, " ~ ", rhs))
+}
+
+make_matrices <- function(form, train, test) {
+  Xtr <- stats::model.matrix(form, train)[, -1, drop = FALSE]
+  Xte <- stats::model.matrix(form, test )[ , -1, drop = FALSE]
+  miss_te <- setdiff(colnames(Xtr), colnames(Xte))
+  if (length(miss_te)) {
+    Xte <- cbind(Xte, matrix(0, nrow(Xte), length(miss_te),
+                             dimnames = list(NULL, miss_te)))
+  }
+  Xte <- Xte[, colnames(Xtr), drop = FALSE]
+  list(X_train = Xtr, X_test = Xte)
+}
+
+# Fit over alpha grid (glmnet path). Choose alpha by CV AUC at chosen lambda.
+fit_model_grid <- function(X, y, alpha_grid, nfolds = 10, type.measure = "auc", weights = NULL, seed_base = 1) {
+  stopifnot(ncol(X) >= 2)
+  best <- list(cvm = -Inf, alpha = NA_real_, lambda = NA_real_, cvfit = NULL)
+  for (i in seq_along(alpha_grid)) {
+    set.seed(seed_base + i)  # reproducible folds for each alpha
+    cvfit <- glmnet::cv.glmnet(
+      X, y, family = "binomial", alpha = alpha_grid[i],
+      nfolds = nfolds, type.measure = type.measure, weights = weights
+    )
+    nz_1se <- sum(stats::coef(cvfit, s = cvfit$lambda.1se) != 0)
+    lambda_final <- if (nz_1se <= 3) cvfit$lambda.min else cvfit$lambda.1se
+    idx <- which.min(abs(cvfit$lambda - lambda_final))
+    cvm_here <- cvfit$cvm[idx]  # for AUC, higher is better
+    if (cvm_here > best$cvm) {
+      best <- list(cvm = cvm_here, alpha = alpha_grid[i], lambda = lambda_final, cvfit = cvfit)
+    }
+  }
+  pred_fun <- function(Xnew) as.numeric(stats::predict(best$cvfit, s = best$lambda, newx = Xnew, type = "response"))
+  list(type = "glmnet", model = best$cvfit, alpha = best$alpha, lambda = best$lambda, predict = pred_fun)
+}
+
+# One-predictor fallback (glm)
+fit_glm_fallback <- function(X, y, weights = NULL) {
+  dfX <- as.data.frame(X); colnames(dfX) <- paste0("V", seq_len(ncol(dfX)))
+  dat <- dfX; dat$y <- as.integer(y)
+  fit <- stats::glm(y ~ ., data = dat, family = stats::binomial(), weights = weights)
+  pred_fun <- function(Xnew) {
+    nd <- as.data.frame(Xnew); colnames(nd) <- paste0("V", seq_len(ncol(nd)))
+    as.numeric(stats::predict(fit, newdata = nd, type = "response"))
+  }
+  list(type = "glm", model = fit, alpha = NA_real_, lambda = NA_real_, predict = pred_fun)
+}
+
+# Metrics on test (threshold can be fixed)
+eval_on_test <- function(y_test, score, thr_fixed = NULL) {
+  roc_obj <- pROC::roc(y_test, score, quiet = TRUE)
+  roc_auc <- as.numeric(pROC::auc(roc_obj))
+  pr_obj  <- PRROC::pr.curve(scores.class0 = score[y_test == 1], scores.class1 = score[y_test == 0], curve = FALSE)
+  thr <- if (is.null(thr_fixed) || length(thr_fixed) == 0 || is.na(thr_fixed)) {
+    as.numeric(pROC::coords(roc_obj, "best", ret = "threshold"))
+  } else thr_fixed
+  pred <- as.integer(score >= thr)
+  tp <- sum(pred == 1 & y_test == 1); tn <- sum(pred == 0 & y_test == 0)
+  fp <- sum(pred == 1 & y_test == 0); fn <- sum(pred == 0 & y_test == 1)
+  accuracy  <- (tp + tn) / length(y_test)
+  sens      <- ifelse(tp + fn > 0, tp / (tp + fn), NA_real_)
+  spec      <- ifelse(tn + fp > 0, tn / (tn + fp), NA_real_)
+  bal_acc   <- mean(c(sens, spec), na.rm = TRUE)
+  precision <- ifelse(tp + fp > 0, tp / (tp + fp), NA_real_)
+  f1        <- ifelse((precision + sens) > 0, 2 * precision * sens / (precision + sens), NA_real_)
+  brier     <- mean((score - y_test)^2)
+  tibble::tibble(
+    ROC_AUC = roc_auc, PR_AUC = pr_obj$auc.integral, threshold = thr,
+    accuracy = accuracy, balanced_accuracy = bal_acc,
+    sensitivity = sens, specificity = spec, precision = precision, F1 = f1, Brier = brier
+  )
+}
+
+# NDVI threshold baseline: cut chosen on TRAIN (raw NDVI used as score)
+ndvi_threshold_baseline <- function(train_df, test_df, y_col, ndvi_col = "s2_jas_ndvi_median") {
+  r <- pROC::roc(train_df[[y_col]], train_df[[ndvi_col]], quiet = TRUE)
+  thr <- as.numeric(pROC::coords(r, "best", ret = "threshold"))
+  tibble::tibble(score = test_df[[ndvi_col]], thr_ndvi = thr)
+}
+
+# Permutation importance (unchanged)
+score_auc <- function(X, y, predict_fun) {
+  p <- predict_fun(X); as.numeric(pROC::auc(pROC::roc(y, p, quiet = TRUE)))
+}
+cols_for_var <- function(var, Xnames) {
+  v <- stringr::str_replace_all(var, "([\\W])", "\\\\\\1")
+  pat_ns  <- paste0("^ns\\(", v, "\\b")
+  pat_int <- paste0("(^|:)", v, "(:|$)")
+  which(stringr::str_detect(Xnames, pat_ns) | stringr::str_detect(Xnames, pat_int))
+}
+perm_importance <- function(vars, X_test_use, y_test, predict_fun, B = 50, seed = 42) {
+  base <- score_auc(X_test_use, y_test, predict_fun)
+  set.seed(seed)
+  Xn <- colnames(X_test_use)
+  res <- lapply(vars, function(v) {
+    cols <- cols_for_var(v, Xn)
+    if (!length(cols)) return(tibble::tibble(var = v, drop_mean = NA_real_, drop_sd = NA_real_, n_cols = 0L, base_auc = base))
+    drops <- numeric(B)
+    for (b in seq_len(B)) {
+      idx <- sample(nrow(X_test_use))
+      Xp <- X_test_use
+      Xp[, cols] <- X_test_use[idx, cols, drop = FALSE]
+      drops[b] <- base - score_auc(Xp, y_test, predict_fun)
+    }
+    tibble::tibble(var = v, drop_mean = mean(drops), drop_sd = sd(drops), n_cols = length(cols), base_auc = base)
+  })
+  dplyr::bind_rows(res) %>% dplyr::arrange(dplyr::desc(drop_mean))
+}
+
+# ------------------------------
+# Common split
+# ------------------------------
+split0 <- rsample::initial_split(mod_dat, prop = 0.8, strata = !!rlang::sym(target_cols[1]))
+train_ids <- rsample::training(split0)$.row
+test_ids  <- rsample::testing(split0)$.row
+
+# ------------------------------
+# Main loop per target
+# ------------------------------
+run_for_target <- function(y_col) {
+  base_cols <- c(".row", y_col, pred_cols, "s2_jas_ndvi_median", "AH_HydroWithFACCover", "AH_HydroNoFACCover")
+  df <- mod_dat %>% dplyr::select(dplyr::any_of(base_cols))
+  train <- df %>% dplyr::filter(.row %in% train_ids)
+  test  <- df %>% dplyr::filter(.row %in% test_ids)
+
+  needed_cols <- c(y_col, pred_cols, "s2_jas_ndvi_median")
+  train <- train %>% tidyr::drop_na(dplyr::all_of(needed_cols))
+  test  <- test  %>% tidyr::drop_na(dplyr::all_of(needed_cols))
+
+  train[[y_col]] <- as.integer(train[[y_col]])
+  test[[y_col]]  <- as.integer(test[[y_col]])
+
+  # Correlation pruning on TRAIN
+  train_pred <- dplyr::select(train, dplyr::all_of(pred_cols))
+  zv <- names(which(sapply(train_pred, function(x) stats::sd(x, na.rm = TRUE) == 0 | all(is.na(x)))))
+  cmat <- suppressWarnings(stats::cor(dplyr::select(train, dplyr::all_of(pred_cols)), use = "pairwise.complete.obs"))
+  high_pairs <- if (!is.null(dim(cmat))) which(abs(cmat) > 0.9 & upper.tri(cmat), arr.ind = TRUE) else matrix(numeric(0), ncol = 2)
+  drop_vars <- unique(c(colnames(cmat)[high_pairs[,2]], zv))
+  pred_core <- setdiff(pred_cols, drop_vars)
+
+  # Build matrices
+  form <- mk_formula(y_col, pred_core, nonlin = nonlinear_vars[nonlinear_vars %in% pred_core], inter_pairs = interaction_pairs)
+  mm <- make_matrices(form, train, test)
+  X_train <- mm$X_train; X_test <- mm$X_test
+  y_train <- as.integer(train[[y_col]]); y_test <- as.integer(test[[y_col]])
+
+  # Simple class weights (positives upweighted): w_pos = n_neg / n_pos
+  n_pos <- sum(y_train == 1); n_neg <- sum(y_train == 0)
+  w <- ifelse(y_train == 1, ifelse(n_pos > 0, n_neg / n_pos, 1), 1)
+
+  # ---- FULL MODEL (alpha grid) ----
+  if (ncol(X_train) >= 2) {
+    fit <- fit_model_grid(X_train, y_train, alpha_grid, nfolds = cv_nfolds, type.measure = cv_type_measure, weights = w, seed_base = cv_seed_base)
+  } else {
+    fit <- fit_glm_fallback(X_train, y_train, weights = w)
+  }
+  p_train_full <- fit$predict(X_train)
+  p_test_full  <- fit$predict(X_test)
+
+  # Threshold chosen on TRAIN (Youden J on training ROC of model scores)
+  roc_full_tr <- pROC::roc(y_train, p_train_full, quiet = TRUE)
+  thr_full    <- as.numeric(pROC::coords(roc_full_tr, "best", ret = "threshold"))
+
+  metrics_full <- eval_on_test(y_test, p_test_full, thr_fixed = thr_full) %>%
+    dplyr::mutate(model = "full_enet", target = y_col, alpha = fit$alpha, lambda = fit$lambda)
+
+  # ---- NDVI-only logistic/GLMNET ----
+  form_ndvi <- stats::as.formula(paste0(y_col, " ~ s2_jas_ndvi_median"))
+  mm2 <- make_matrices(form_ndvi, train, test)
+
+  if (ncol(mm2$X_train) >= 2) {
+    fit_ndvi <- fit_model_grid(mm2$X_train, y_train, alpha_grid, nfolds = cv_nfolds, type.measure = cv_type_measure, weights = w, seed_base = cv_seed_base + 1000)
+  } else {
+    fit_ndvi <- fit_glm_fallback(mm2$X_train, y_train, weights = w)
+  }
+  p_train_ndvi <- fit_ndvi$predict(mm2$X_train)
+  p_test_ndvi  <- fit_ndvi$predict(mm2$X_test)
+
+  roc_ndvi_tr <- pROC::roc(y_train, p_train_ndvi, quiet = TRUE)
+  thr_ndvi    <- as.numeric(pROC::coords(roc_ndvi_tr, "best", ret = "threshold"))
+
+  metrics_ndvi <- eval_on_test(y_test, p_test_ndvi, thr_fixed = thr_ndvi) %>%
+    dplyr::mutate(model = "ndvi_only_glmnet", target = y_col, alpha = fit_ndvi$alpha, lambda = fit_ndvi$lambda)
+
+  # ---- NDVI threshold rule (cut from TRAIN NDVI) ----
+  ndvi_rule <- ndvi_threshold_baseline(train, test, y_col, "s2_jas_ndvi_median")
+  thr_val   <- ndvi_rule$thr_ndvi[[1]]
+  metrics_rule <- eval_on_test(y_test, score = ndvi_rule$score, thr_fixed = thr_val) %>%
+    dplyr::mutate(model = "ndvi_threshold_rule", target = y_col, threshold = thr_val)
+
+  # Permutation importance (full model only)
+  imp <- perm_importance(pred_core, X_test, y_test, predict_fun = fit$predict, B = 50, seed = 42) %>%
+    dplyr::mutate(target = y_col)
+
+  # Predictions for plotting (keep your structure)
+  preds_full <- test %>%
+    dplyr::transmute(
+      .row, target = y_col, model = "full_enet",
+      obs = !!rlang::sym(y_col),
+      pred_prob = p_test_full,
+      s2_jas_ndvi_median = .data[["s2_jas_ndvi_median"]],
+      AH_HydroWithFACCover = dplyr::coalesce(.data[["AH_HydroWithFACCover"]], NA_real_),
+      AH_HydroNoFACCover   = dplyr::coalesce(.data[["AH_HydroNoFACCover"]],   NA_real_)
+    )
+  preds_ndvi <- test %>%
+    dplyr::transmute(
+      .row, target = y_col, model = "ndvi_only_glmnet",
+      obs = !!rlang::sym(y_col),
+      pred_prob = p_test_ndvi,
+      s2_jas_ndvi_median = .data[["s2_jas_ndvi_median"]],
+      AH_HydroWithFACCover = dplyr::coalesce(.data[["AH_HydroWithFACCover"]], NA_real_),
+      AH_HydroNoFACCover   = dplyr::coalesce(.data[["AH_HydroNoFACCover"]],   NA_real_)
+    )
+  preds_rule <- test %>%
+    dplyr::transmute(
+      .row, target = y_col, model = "ndvi_threshold_rule",
+      obs = !!rlang::sym(y_col),
+      pred_prob = scales::rescale(.data[["s2_jas_ndvi_median"]], to = c(0.001, 0.999)), # for plotting/curves only
+      s2_jas_ndvi_median = .data[["s2_jas_ndvi_median"]],
+      AH_HydroWithFACCover = dplyr::coalesce(.data[["AH_HydroWithFACCover"]], NA_real_),
+      AH_HydroNoFACCover   = dplyr::coalesce(.data[["AH_HydroNoFACCover"]],   NA_real_)
+    )
+
+  list(
+    results = dplyr::bind_rows(metrics_full, metrics_ndvi, metrics_rule) %>% dplyr::relocate(target, model),
+    importance = imp,
+    predictions = dplyr::bind_rows(preds_full, preds_ndvi, preds_rule),
+    kept_predictors = pred_core,
+    dropped_for_corr = drop_vars
+  )
+}
+
+# Run
+out_list    <- purrr::map(target_cols, run_for_target)
+results_tbl <- dplyr::bind_rows(purrr::map(out_list, "results"))
+perm_all    <- dplyr::bind_rows(purrr::map(out_list, "importance"))
+preds_all   <- dplyr::bind_rows(purrr::map(out_list, "predictions"))
+
+# Summaries (unchanged)
+results_wide <- results_tbl %>%
+  dplyr::select(target, model, ROC_AUC, PR_AUC, F1, accuracy, sensitivity, specificity, balanced_accuracy, Brier, threshold) %>%
+  dplyr::arrange(target, dplyr::desc(ROC_AUC))
+
+perm_ranked <- perm_all %>%
+  dplyr::group_by(target) %>%
+  dplyr::mutate(rank = rank(-tidyr::replace_na(drop_mean, -Inf), ties.method = "average")) %>%
+  dplyr::ungroup()
+
+perm_summary <- perm_ranked %>%
+  dplyr::group_by(var) %>%
+  dplyr::summarise(
+    mean_drop = mean(drop_mean, na.rm = TRUE),
+    sd_drop   = sd(drop_mean, na.rm = TRUE),
+    mean_rank = mean(rank, na.rm = TRUE),
+    n_targets = dplyr::n_distinct(target),
+    .groups = "drop"
+  ) %>% dplyr::arrange(dplyr::desc(mean_drop))
+
+results_wide
+perm_summary
+results_wide %>% 
+  filter(model %in% c('full_enet','ndvi_threshold_rule')) %>% 
+  dplyr::select(target, model, ROC_AUC:F1,balanced_accuracy) %>% 
+  pivot_longer(ROC_AUC:balanced_accuracy) %>% 
+  ggplot(aes(model, value, fill=model))+geom_col()+
+  facet_grid(cols=vars(target),rows=vars(name), scales='free_y')+
+  scale_fill_ptol()
+
+metrics <- c("ROC_AUC","PR_AUC","F1","balanced_accuracy")
+
+
+db_dat <- results_wide %>%
+  dplyr::filter(model %in% c("full_enet","ndvi_threshold_rule")) %>%
+  dplyr::select(target, model, dplyr::all_of(metrics)) %>%
+  tidyr::pivot_longer(dplyr::all_of(metrics), names_to = "metric", values_to = "value") %>%
+  tidyr::pivot_wider(names_from = model, values_from = value) %>%
+  dplyr::mutate(metric = factor(metric, levels = metrics))
+
+ggplot(db_dat, aes(y = target)) +
+  geom_segment(aes(x = ndvi_threshold_rule, xend = full_enet, yend = target), color = "grey60") +
+  geom_point(aes(x = ndvi_threshold_rule, color = "NDVI threshold"), size = 2.5) +
+  geom_point(aes(x = full_enet,         color = "Full ENet"), size = 2.5) +
+  facet_wrap(~ metric, ncol = 2, scales = "free_x",
+             labeller = labeller(metric = ~ gsub("_", " ", .))) +
+  labs(x = "Score", y = NULL, color = "Model") +
+  ggthemes::scale_color_ptol() +
+  theme_bw()
+
+
+
+```
+
+### RF
+```{r}
+
+# ------------------------------
+# Add this near your library block
+# ------------------------------
+library(ranger)
+
+# ------------------------------
+# RF helpers (CV tuning + OOF threshold + final fit)
+# ------------------------------
+
+# Make a small, regularized grid tailored to p predictors
+rf_param_grid <- function(p) {
+  # conservative choices for small n to reduce overfitting
+  mtry_cand <- unique(pmax(1, pmin(p, round(c(sqrt(p), p/3, 2*sqrt(p))))))
+  expand.grid(
+    mtry = mtry_cand,
+    min.node.size = c(5L, 10L, 15L),
+    max.depth = c(4L, 6L, 8L),
+    stringsAsFactors = FALSE
+  )
+}
+
+# 5-fold CV AUC for a given param set (train-only)
+rf_cv_auc <- function(train_df, y_col, pred_cols, params, v = 5, seed = 7001) {
+  set.seed(seed)
+  folds <- rsample::vfold_cv(train_df, v = v, strata = !!rlang::sym(y_col))
+  aucs <- numeric(length(folds$splits))
+  for (i in seq_along(folds$splits)) {
+    tr <- rsample::analysis(folds$splits[[i]])
+    va <- rsample::assessment(folds$splits[[i]])
+
+    # ensure both classes exist in assessment fold
+    if (length(unique(va[[y_col]])) < 2) { aucs[i] <- NA_real_; next }
+
+    # ranger needs factor outcome for classification with probability=TRUE
+    tr_fit_df <- tr %>% dplyr::select(dplyr::all_of(c(y_col, pred_cols)))
+    va_df     <- va %>% dplyr::select(dplyr::all_of(c(y_col, pred_cols)))
+    tr_fit_df[[y_col]] <- factor(tr_fit_df[[y_col]], levels = c(0,1))
+
+    set.seed(seed + i)  # reproducible per-fold fit
+    fit <- ranger::ranger(
+      formula = stats::as.formula(paste0(y_col, " ~ .")),
+      data = tr_fit_df,
+      probability = TRUE,
+      num.trees = 500,
+      mtry = params$mtry,
+      min.node.size = params$min.node.size,
+      max.depth = params$max.depth,
+      replace = TRUE,
+      importance = "none",
+      seed = seed + i
+    )
+    pr <- predict(fit, data = va_df)$predictions[, "1"]
+    aucs[i] <- as.numeric(pROC::auc(pROC::roc(va_df[[y_col]], pr, quiet = TRUE)))
+  }
+  mean(aucs, na.rm = TRUE)
+}
+
+# Tune RF on TRAIN via CV AUC
+rf_tune <- function(train_df, y_col, pred_cols, v = 5, seed = 7001) {
+  p <- length(pred_cols)
+  grid <- rf_param_grid(p)
+  grid$cv_auc <- NA_real_
+
+  for (i in seq_len(nrow(grid))) {
+    grid$cv_auc[i] <- rf_cv_auc(train_df, y_col, pred_cols, grid[i, ], v = v, seed = seed + 100*i)
+  }
+
+  # pick best by CV AUC; tie-break to simpler model (larger min.node.size, smaller max.depth)
+  best <- grid %>%
+    dplyr::arrange(dplyr::desc(cv_auc),
+                   dplyr::desc(min.node.size),
+                   max.depth,
+                   mtry) %>%
+    dplyr::slice(1)
+  best
+}
+
+# Get OOF predictions on TRAIN for a fixed param set (for threshold selection)
+rf_oof_preds <- function(train_df, y_col, pred_cols, params, v = 5, seed = 8001) {
+  set.seed(seed)
+  folds <- rsample::vfold_cv(train_df, v = v, strata = !!rlang::sym(y_col))
+  oof <- rep(NA_real_, nrow(train_df))
+
+  for (i in seq_along(folds$splits)) {
+    tr_all <- rsample::analysis(folds$splits[[i]])
+    va_all <- rsample::assessment(folds$splits[[i]])
+
+    # keep .row for indexing after we select columns
+    tr_fit_df <- tr_all %>% dplyr::select(dplyr::all_of(c(y_col, pred_cols)))
+    va_df     <- va_all %>% dplyr::select(dplyr::all_of(c(y_col, pred_cols)))
+
+    # factor outcome with levels 0/1
+    tr_fit_df[[y_col]] <- factor(tr_fit_df[[y_col]], levels = c(0, 1))
+
+    set.seed(seed + i)
+    fit <- ranger::ranger(
+      formula = stats::as.formula(paste0(y_col, " ~ .")),
+      data = tr_fit_df,
+      probability = TRUE,
+      num.trees = 500,
+      mtry = params$mtry,
+      min.node.size = params$min.node.size,
+      max.depth = params$max.depth,
+      replace = TRUE,
+      importance = "none",
+      seed = seed + i
+    )
+
+    pr <- predict(fit, data = va_df)$predictions[, "1"]
+
+    # map predictions back using .row IDs
+    pos <- match(va_all$.row, train_df$.row)
+    oof[pos] <- pr
+  }
+
+  oof
+}
+
+# Fit final RF on full TRAIN and predict on TEST (+ importance)
+rf_fit_predict <- function(train_df, test_df, y_col, pred_cols, params, seed = 9001) {
+  tr_fit_df <- train_df %>% dplyr::select(dplyr::all_of(c(y_col, pred_cols)))
+  te_df     <- test_df  %>% dplyr::select(dplyr::all_of(c(y_col, pred_cols)))
+  tr_fit_df[[y_col]] <- factor(tr_fit_df[[y_col]], levels = c(0,1))
+
+  set.seed(seed)
+  fit <- ranger::ranger(
+    formula = stats::as.formula(paste0(y_col, " ~ .")),
+    data = tr_fit_df,
+    probability = TRUE,
+    num.trees = 500,
+    mtry = params$mtry,
+    min.node.size = params$min.node.size,
+    max.depth = params$max.depth,
+    replace = TRUE,
+    importance = "permutation",  # post-hoc importance from final fit
+    seed = seed
+  )
+  preds <- predict(fit, data = te_df)$predictions[, "1"]
+  imp <- tibble::tibble(
+    var = names(fit$variable.importance),
+    rf_perm_importance = as.numeric(fit$variable.importance)
+  ) %>% dplyr::arrange(dplyr::desc(rf_perm_importance))
+  list(pred = preds, fit = fit, importance = imp)
+}
+
+# ------------------------------
+# RF per-target runner (reuses your split & preprocessing)
+# ------------------------------
+run_for_target_rf <- function(y_col) {
+  # Build TRAIN/TEST the same way you do for the GLMNET pipeline
+  base_cols <- c(".row", y_col, pred_cols, "s2_jas_ndvi_median", "AH_HydroWithFACCover", "AH_HydroNoFACCover")
+  df <- mod_dat %>% dplyr::select(dplyr::any_of(base_cols))
+  train <- df %>% dplyr::filter(.row %in% train_ids)
+  test  <- df %>% dplyr::filter(.row %in% test_ids)
+
+  # Keep only complete rows
+  needed_cols <- c(y_col, pred_cols, "s2_jas_ndvi_median")
+  train <- train %>% tidyr::drop_na(dplyr::all_of(needed_cols))
+  test  <- test  %>% tidyr::drop_na(dplyr::all_of(needed_cols))
+
+  # enforce 0/1 integers
+  train[[y_col]] <- as.integer(train[[y_col]])
+  test[[y_col]]  <- as.integer(test[[y_col]])
+
+  # (Optional) you *could* skip correlation pruning for RF; we'll keep your pruned set for parity
+  train_pred <- dplyr::select(train, dplyr::all_of(pred_cols))
+  zv <- names(which(sapply(train_pred, function(x) stats::sd(x, na.rm = TRUE) == 0 | all(is.na(x)))))
+  cmat <- suppressWarnings(stats::cor(dplyr::select(train, dplyr::all_of(pred_cols)), use = "pairwise.complete.obs"))
+  high_pairs <- if (!is.null(dim(cmat))) which(abs(cmat) > 0.9 & upper.tri(cmat), arr.ind = TRUE) else matrix(numeric(0), ncol = 2)
+  drop_vars <- unique(c(colnames(cmat)[high_pairs[,2]], zv))
+  pred_core <- setdiff(pred_cols, drop_vars)
+
+  # --- Tune RF on TRAIN via CV AUC ---
+  best <- rf_tune(train, y_col, pred_core, v = 5, seed = 7001)
+
+  # --- OOF predictions on TRAIN with best params -> pick threshold (train-only) ---
+  oof <- rf_oof_preds(train, y_col, pred_core, params = best, v = 5, seed = 8001)
+  roc_oof <- pROC::roc(train[[y_col]], oof, quiet = TRUE)
+  thr_rf  <- as.numeric(pROC::coords(roc_oof, "best", ret = "threshold"))
+
+  # --- Final fit on TRAIN and predict TEST ---
+  fp <- rf_fit_predict(train, test, y_col, pred_core, params = best, seed = 9001)
+  p_rf_test <- fp$pred
+
+  # --- Evaluate on TEST using train-chosen threshold ---
+  metrics_rf <- eval_on_test(y_test = test[[y_col]], score = p_rf_test, thr_fixed = thr_rf) %>%
+    dplyr::mutate(model = "rf", target = y_col,
+                  mtry = best$mtry, min.node.size = best$min.node.size, max.depth = best$max.depth)
+
+  # --- Predictions tibble for plotting (same shape as yours) ---
+  preds_rf <- test %>%
+    dplyr::transmute(
+      .row, target = y_col, model = "rf",
+      obs = !!rlang::sym(y_col),
+      pred_prob = p_rf_test,
+      s2_jas_ndvi_median = .data[["s2_jas_ndvi_median"]],
+      AH_HydroWithFACCover = dplyr::coalesce(.data[["AH_HydroWithFACCover"]], NA_real_),
+      AH_HydroNoFACCover   = dplyr::coalesce(.data[["AH_HydroNoFACCover"]],   NA_real_)
+    )
+
+  list(
+    results = metrics_rf %>% dplyr::relocate(target, model),
+    predictions = preds_rf,
+    importance = fp$importance,           # RF permutation importance from final fit
+    kept_predictors = pred_core,
+    dropped_for_corr = drop_vars,
+    rf_best_params = best,
+    rf_threshold_train = thr_rf
+  )
+}
+
+# Fit RF per target
+rf_out_list <- purrr::map(target_cols, run_for_target_rf)
+
+# Bind RF results with your existing results
+results_tbl_rf <- dplyr::bind_rows(purrr::map(rf_out_list, "results"))
+preds_all_rf   <- dplyr::bind_rows(purrr::map(rf_out_list, "predictions"))
+rf_imp_all     <- dplyr::bind_rows(purrr::map(rf_out_list, "importance")) %>%
+  dplyr::mutate(model = "rf")
+
+# Combine metrics table
+results_wide_all <- dplyr::bind_rows(results_tbl, results_tbl_rf) %>%
+  dplyr::select(target, model, ROC_AUC, PR_AUC, F1, accuracy, sensitivity, specificity, balanced_accuracy, Brier, threshold) %>%
+  dplyr::arrange(target, dplyr::desc(ROC_AUC))
+
+# If you want to add RF predictions to your existing plots:
+preds_all <- dplyr::bind_rows(preds_all, preds_all_rf)
+
+# Quick peek
+results_wide_all
+rf_imp_all %>% dplyr::group_by(var) %>% dplyr::summarise(mean_rf_imp = mean(rf_perm_importance, na.rm=TRUE)) %>%
+  dplyr::arrange(dplyr::desc(mean_rf_imp))
+
+
+db_dat <- results_wide_all %>%
+  dplyr::filter(model %in% c("full_enet","ndvi_threshold_rule",'rf')) %>%
+  dplyr::select(target, model, dplyr::all_of(metrics)) %>%
+  tidyr::pivot_longer(dplyr::all_of(metrics), names_to = "metric", values_to = "value") %>%
+  tidyr::pivot_wider(names_from = model, values_from = value) %>%
+  dplyr::mutate(metric = factor(metric, levels = metrics))
+
+p<- ggplot(db_dat, aes(y = target)) +
+  geom_segment(aes(x = ndvi_threshold_rule, xend = full_enet, yend = target), color = "grey60") +
+  geom_point(aes(x = ndvi_threshold_rule, color = "NDVI threshold"), size = 2.5) +
+  geom_point(aes(x = full_enet,         color = "Full ENet"), size = 2.5) +
+  geom_point(aes(x = rf,         color = "Random Forest"), size = 2.5) +
+
+  facet_wrap(~ metric, ncol = 2, scales = "free_x",
+             labeller = labeller(metric = ~ gsub("_", " ", .))) +
+  labs(x = "Score", y = NULL, color = "Model") +
+  ggthemes::scale_color_ptol() +
+  theme_bw()
+
+p %>% ggsave('AIM_RW/figures/classification/multi_indicator/performance_dot_plots.png',.,width=8, height=6)
+
+# example:
+p1<- preds_all %>% 
+  filter(model!='ndvi_only_glmnet') %>% 
+  plot_pred_vs_original()+
+  ggthemes::scale_color_ptol(labels=c('Full Enet','NDVI Threshold','Random Forest'))+
+  labs(x='Observed Cover (%)', y='Prediction Score')
+
+p1 %>% ggsave('AIM_RW/figures/classification/multi_indicator/prediction_vs_org_pct.png',.,width=8, height=6)
+
+```
+
+### plots
+
+```{r}
+plot_pred_vs_ndvi <- function(preds, smooth = TRUE) {
+  g <- ggplot(preds, aes(x = s2_jas_ndvi_median, y = pred_prob, color = model)) +
+    geom_point(alpha = 0.55, size = 2) +
+    scale_y_continuous(limits = c(0, 1)) +
+    labs(x = "S2 JAS NDVI (median)", y = "Predicted probability", color = "Model") +
+    theme_bw()
+  if (smooth) g <- g + geom_smooth(se = FALSE, method = "loess", formula = y ~ x)
+  g + facet_wrap(~ target, scales = "free_x")
+}
+
+# example:
+plot_pred_vs_ndvi(preds_all)
+
+plot_pred_vs_original <- function(preds) {
+  preds2 <- preds %>%
+    dplyr::mutate(
+      original_cover = dplyr::case_when(
+        stringr::str_detect(target, "FACwet")   ~ AH_HydroWithFACCover,
+        stringr::str_detect(target, "noFACwet") ~ AH_HydroNoFACCover,
+        TRUE ~ NA_real_
+      )
+    )
+  ggplot(preds2, aes(x = original_cover, y = pred_prob, color = model)) +
+    geom_point(alpha = 0.55, size = 2) +
+    scale_y_continuous(limits = c(0, 1)) +
+    labs(x = "Original hydrophytic cover (%)", y = "Predicted probability", color = "Model") +
+    theme_bw() +
+    geom_smooth(se = FALSE, method = "loess", formula = y ~ x) +
+    facet_wrap(~ target, scales = "free_x")
+}
+
+# example:
+plot_pred_vs_original(preds_all)
+
+plot_probs_by_class <- function(preds) {
+  ggplot(preds, aes(x = factor(obs), y = pred_prob, fill = model)) +
+    geom_violin(alpha = 0.5, trim = FALSE) +
+    geom_boxplot(width = 0.15, outlier.shape = NA, position = position_dodge(width = 0.9)) +
+    scale_y_continuous(limits = c(0, 1)) +
+    labs(x = "Observed class", y = "Predicted probability", fill = "Model") +
+    theme_bw() +
+    facet_wrap(~ target)
+}
+
+# example:
+plot_probs_by_class(preds_all)
+
+plot_calibration <- function(preds, bins = 10) {
+  cal <- preds %>%
+    dplyr::group_by(target, model) %>%
+    dplyr::mutate(bin = dplyr::ntile(pred_prob, bins)) %>%
+    dplyr::group_by(target, model, bin) %>%
+    dplyr::summarise(
+      pred_mean = mean(pred_prob, na.rm = TRUE),
+      obs_rate  = mean(obs, na.rm = TRUE),
+      n = dplyr::n(), .groups = "drop"
+    )
+  ggplot(cal, aes(x = pred_mean, y = obs_rate, color = model)) +
+    geom_abline(slope = 1, intercept = 0, linetype = 2) +
+    geom_line() + geom_point() +
+    coord_equal(xlim = c(0,1), ylim = c(0,1)) +
+    labs(x = "Mean predicted probability (bin)", y = "Observed positive rate", color = "Model") +
+    theme_bw() +
+    facet_wrap(~ target)
+}
+
+# example:
+plot_calibration(preds_all)
+
+roc_df <- function(preds) {
+  preds %>%
+    dplyr::group_by(target, model) %>%
+    dplyr::group_modify(~{
+      r <- pROC::roc(.x$obs, .x$pred_prob, quiet = TRUE)
+      tibble::tibble(
+        fpr = 1 - r$specificities,
+        tpr = r$sensitivities
+      )
+    }) %>% dplyr::ungroup()
+}
+
+plot_roc <- function(preds) {
+  df <- roc_df(preds)
+  ggplot(df, aes(x = fpr, y = tpr, color = model)) +
+    geom_line(size = 1) +
+    geom_abline(slope = 1, intercept = 0, linetype = 2) +
+    labs(x = "False Positive Rate", y = "True Positive Rate", color = "Model") +
+    theme_bw() +
+    facet_wrap(~ target)
+}
+
+# example:
+plot_roc(preds_all)
+
+pr_df <- function(preds) {
+  preds %>%
+    dplyr::group_by(target, model) %>%
+    dplyr::group_modify(~{
+      sc1 <- .x$pred_prob[.x$obs == 1]
+      sc0 <- .x$pred_prob[.x$obs == 0]
+      pr  <- PRROC::pr.curve(scores.class0 = sc1, scores.class1 = sc0, curve = TRUE)
+      cm  <- as.data.frame(pr$curve)
+      # PRROC returns columns: recall, precision, thresholds (order: 1-recall? depends version)
+      # Standardize names safely:
+      names(cm)[1:2] <- c("Recall","Precision")
+      tibble::tibble(Recall = cm$Recall, Precision = cm$Precision)
+    }) %>% dplyr::ungroup()
+}
+
+plot_pr <- function(preds) {
+  df <- pr_df(preds)
+  ggplot(df, aes(x = Recall, y = Precision, color = model)) +
+    geom_line(size = 1) +
+    labs(x = "Recall", y = "Precision", color = "Model") +
+    theme_bw() +
+    facet_wrap(~ target)
+}
+
+# example:
+plot_pr(preds_all)
+
+plot_perm_importance <- function(perm_tbl, top_k = 10) {
+  perm_plot <- perm_tbl %>%
+    dplyr::group_by(target) %>%
+    dplyr::slice_max(order_by = drop_mean, n = top_k, with_ties = FALSE) %>%
+    dplyr::ungroup() %>%
+    dplyr::mutate(var = forcats::fct_reorder(var, drop_mean))
+  ggplot(perm_plot, aes(x = var, y = drop_mean)) +
+    geom_col() +
+    geom_errorbar(aes(ymin = pmax(0, drop_mean - drop_sd), ymax = drop_mean + drop_sd), width = 0.2) +
+    coord_flip() +
+    labs(x = NULL, y = "AUC drop (permutation importance)") +
+    theme_bw() +
+    facet_wrap(~ target, scales = "free_y")
+}
+
+# example:
+plot_perm_importance(perm_all, top_k = 8)
+
+
+
+# 1) Gather ENet permutation importance (AUC drop); clip negatives to 0
+enet_imp <- perm_all %>%
+  dplyr::transmute(target, var, model = "full_enet", imp_raw = pmax(drop_mean, 0))
+
+# 2) Gather RF permutation importance and add target/model
+rf_imp_all <- purrr::map2_df(rf_out_list, target_cols, ~
+  .x$importance %>% dplyr::mutate(target = .y, model = "rf")
+) %>%
+  dplyr::rename(imp_raw = rf_perm_importance)
+
+# 3) Combine and normalize within (target, model)
+imp_norm <- dplyr::bind_rows(enet_imp, rf_imp_all) %>%
+  dplyr::group_by(target, model) %>%
+  dplyr::mutate(
+    imp_rank    = dplyr::dense_rank(dplyr::desc(imp_raw)),          # rank (1 = most important)
+    imp_rel_max = imp_raw / max(imp_raw, na.rm = TRUE),             # 0–1 vs model’s top feature
+    imp_rel_sum = imp_raw / sum(imp_raw, na.rm = TRUE)              # share of total importance
+  ) %>%
+  dplyr::ungroup()
+
+# 4) Build a comparison table on the union of top-k features from each model
+top_k <- 10
+top_enet <- imp_norm %>% dplyr::filter(model == "full_enet") %>%
+  dplyr::group_by(target) %>% dplyr::slice_max(imp_raw, n = top_k, with_ties = FALSE) %>%
+  dplyr::ungroup() %>% dplyr::select(target, var)
+top_rf <- imp_norm %>% dplyr::filter(model == "rf") %>%
+  dplyr::group_by(target) %>% dplyr::slice_max(imp_raw, n = top_k, with_ties = FALSE) %>%
+  dplyr::ungroup() %>% dplyr::select(target, var)
+
+top_union <- dplyr::distinct(dplyr::bind_rows(top_enet, top_rf))
+
+compare_tbl <- top_union %>%
+  dplyr::left_join(
+    imp_norm %>% dplyr::filter(model == "full_enet") %>%
+      dplyr::select(target, var, enet_rank = imp_rank, enet_rel = imp_rel_max),
+    by = c("target","var")
+  ) %>%
+  dplyr::left_join(
+    imp_norm %>% dplyr::filter(model == "rf") %>%
+      dplyr::select(target, var, rf_rank = imp_rank, rf_rel = imp_rel_max),
+    by = c("target","var")
+  ) %>%
+  dplyr::arrange(target, dplyr::coalesce(enet_rank, Inf), dplyr::coalesce(rf_rank, Inf))
+
+pd <- position_dodge(width = 0.7)
+
+
+p_rel_feat<- compare_tbl %>% 
+  dplyr::select(target, var, enet_rel, rf_rel) %>% 
+  mutate(var = fct_rev(fct_reorder(var, enet_rel))) %>% 
+  pivot_longer(c(enet_rel, rf_rel)) %>% 
+  group_by(var,name) %>% 
+  summarize(mean_rel = mean(value), sd_rel = sd(value)) %>% 
+  ggplot(aes(var, mean_rel, fill=name))+
+  geom_col(position = pd)+
+  geom_errorbar(aes(ymin = mean_rel-sd_rel, ymax = mean_rel + sd_rel),
+                position = pd, width = 0.2) +
+  #facet_wrap(~target)+
+  theme_few()+
+  scale_fill_ptol(labels=c('Full Enet','Random Forest'))+
+  theme(axis.text.x= element_text(angle = 90, vjust=0.5, hjust=1))+
+  labs(x='',y='Relative Feature Importance (Mean ± SD)', fill='Model')
+
+p_rel_feat %>% ggsave('AIM_RW/figures/classification/multi_indicator/rel_perm_importance.png',.,height = 8, width =8)  
+```
+
+
+
+#	RS Indicator by Wetland Plot Layout, Targeted/Random, Wetland Type and HGM Class (boxplots)
+
+```{r}
+
+# Helper function to create a plot for a specific metric and categorical variable
+create_metric_plot <- function(data, metric_name, category_var, 
+                               metric_col = "metric", value_col = "value", season_col = "season") {
+  if(season_col == 'NA'){
+    data %>% 
+      filter(!!sym(metric_col) == metric_name) %>% 
+      ggplot(aes(!!sym(category_var), !!sym(value_col))) +
+      geom_boxplot(outliers = FALSE)+
+      geom_jitter(
+       # aes(fill = !!sym(season_col)), 
+        position = position_jitter(width=0.2),
+        size = 1.5,
+        alpha = 0.3,
+        shape = 21,
+        show.legend = FALSE 
+      ) +
+      scale_fill_ptol() +
+      theme_bw() +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1, size = 8))
+    
+  }else{
+    data %>% 
+    filter(!!sym(metric_col) == metric_name) %>% 
+    ggplot(aes(!!sym(category_var), !!sym(value_col), fill = !!sym(season_col)))+
+    geom_boxplot(outliers = FALSE)+
+    geom_jitter(
+      aes(fill = !!sym(season_col)), 
+      position = position_jitterdodge(jitter.width = 0.2, dodge.width = 0.75),
+      size = 1.5,
+      alpha = 0.3,
+      shape = 21,
+      show.legend = FALSE 
+    ) +
+    scale_fill_ptol() +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1, size = 8))
+    
+  }
+}
+
+# Main function to generate plots for any metric
+generate_metric_plots <- function(
+  data,                    # The joined dataset (dat_joined)
+  metric_name,             # Name of the metric to plot (e.g., "ndvi")
+  category_vars = c("WetlandType", "PlotLayout", "SamplingApproach", "HGMClass"),
+  metric_col = "metric",   # Column containing metric names
+  value_col = "value",     # Column containing metric values
+  season_col = "season",   # Column used for coloring
+  subtitle = "All Nevada Plots", # Subtitle for the plot
+  save_path = NULL,        # Optional path to save the plot
+  prefix = "nevada_",      # Prefix for saved filename
+  width = 12,              # Width of saved plot
+  height = 8               # Height of saved plot
+) {
+  
+  # Ensure we have exactly 4 category variables for the 2x2 grid
+  if (length(category_vars) != 4) {
+    stop("This function requires exactly 4 category variables for the 2x2 grid layout")
+  }
+  
+  # Create individual plots
+  plots <- list()
+  for (i in 1:4) {
+    plots[[i]] <- create_metric_plot(
+      data, 
+      metric_name, 
+      category_vars[i], 
+      metric_col = metric_col,
+      value_col = value_col,
+      season_col = season_col
+    )
+  }
+  
+  # Combine plots in a 2x2 grid
+  
+  if(season_col == 'NA'){
+    p_combined <- (plots[[1]] + plots[[2]]) / (plots[[3]] + plots[[4]]) +
+      plot_layout(guides = 'collect')+
+      plot_annotation(
+        title = paste0(toupper(metric_name), " by Plot Characteristics"),
+        subtitle = subtitle,
+        theme = theme(
+          plot.title = element_text(hjust = 0.5, size = 12),
+          plot.subtitle = element_text(hjust = 0.5)
+        )
+      )
+  } else{
+      p_combined <- (plots[[1]] + plots[[2]]) / (plots[[3]] + plots[[4]]) +
+      plot_layout(guides = 'collect')+
+      plot_annotation(
+        title = paste0(toupper(metric_name), " by Plot Characteristics and Season"),
+        subtitle = subtitle,
+        theme = theme(
+          plot.title = element_text(hjust = 0.5, size = 12),
+          plot.subtitle = element_text(hjust = 0.5)
+        )
+      )
+    
+  }
+  
+  # Save plot if path is provided
+  if (!is.null(save_path)) {
+    p_combined %>% ggsave(
+      filename = file.path(save_path, paste0(prefix, metric_name, "_by_plot_char.png")),
+      plot = .,
+      width = width,
+      height = height
+    )
+  }
+  
+  # Return the combined plot
+  return(p_combined)
+}
+
+# Example usage:
+rs_cln_lng
+
+dat_joined <- indicators_cln %>% 
+  #filter(StateCode == 'NV') %>% 
+  inner_join(rs_cln_lng ) %>% 
+  filter(!is.na(rs_value))
+
+#Generate plots for different metrics
+p_ndvi <- generate_metric_plots(
+  data = dat_joined,
+  metric_name = "ndvi",
+  metric_col = "metric",   # Column containing metric names
+  value_col='rs_value',
+  save_path = "AIM_RW/figures/v2"
+)
+
+#Generate plots for different metrics
+p_ndwi <- generate_metric_plots(
+  data = dat_joined,
+  metric_name = "ndwi",
+  metric_col = "metric",   # Column containing metric names
+  value_col='rs_value',
+  save_path = "AIM_RW/figures/v2"
+)
+
+p_rri_5year <- generate_metric_plots(
+  data = dat_joined,
+  metric_name = "rri_5year",
+  value_col='rs_value',
+  season_col = 'NA',
+  save_path = "AIM_RW/figures/v2"
+)
+
+p_rri_10year <- generate_metric_plots(
+  data = dat_joined,
+  metric_name = "rri_10year",
+  value_col='rs_value',
+  season_col = 'NA',
+  save_path = "AIM_RW/figures/v2"
+)
+
+p_ndvi_seasDiff <- generate_metric_plots(
+  data = dat_joined,
+  metric_name = "ndvi_seasdiff",
+  metric_col = "metric",
+  value_col = "rs_value",
+  season_col = 'NA',
+ # category_vars = c("Category1", "Category2", "Category3", "Category4"),
+  #subtitle = "Your custom subtitle",
+  save_path = "AIM_RW/figures/v2"
+#  prefix = "your_prefix_"
+)
+
+p_ndwi_seasDiff <- generate_metric_plots(
+  data = dat_joined,
+  metric_name = "ndwi_seasdiff",
+  metric_col = "metric",
+  value_col = "rs_value",
+  season_col = 'NA',
+ # category_vars = c("Category1", "Category2", "Category3", "Category4"),
+  #subtitle = "Your custom subtitle",
+  save_path = "AIM_RW/figures/v2"
+#  prefix = "your_prefix_"
+)
+
+
+p_ndvi_5year_mean <- generate_metric_plots(
+  data = dat_joined,
+  metric_name = "ndvi_mean",
+  metric_col = "metric",
+  value_col = "rs_value",
+  season_col = "season",
+ # category_vars = c("Category1", "Category2", "Category3", "Category4"),
+  #subtitle = "Your custom subtitle",
+  save_path = "AIM_RW/figures/v2"
+#  prefix = "your_prefix_"
+)
+
+p_ndvi_5year_sd <- generate_metric_plots(
+  data = dat_joined,
+  metric_name = "ndvi_sd",
+  metric_col = "metric",
+  value_col = "rs_value",
+  season_col = "season",
+  save_path = "AIM_RW/figures/v2"
+)
+
+p_mvp<- generate_metric_plots(
+  data = dat_joined,
+  metric_name = "mvp",
+  metric_col = "metric",
+  value_col = "rs_value",
+  season_col = "season",
+  save_path = "AIM_RW/figures/v2"
+)
+
+```
+
+
+
+
+<!-- ```{r} -->
+<!-- # Method 3: Automated midpoint calculation -->
+<!-- breaks <- c(0, 5, 10,15, 20, 30, 40, 50, 60) -->
+<!-- midpoints <- (breaks[-1] + breaks[-length(breaks)]) / 2 -->
+
+<!-- dat_wide_joined %>%  -->
+<!--   left_join(rw_plots) %>%  -->
+<!--      mutate(width_group = cut(AvgWidthArea_1, breaks = breaks)) %>%  -->
+<!--   group_by(width_group) %>% tally() -->
+
+
+<!-- cor_by_width<- dat_joined %>%  -->
+<!--   left_join(rw_plots) %>%  -->
+<!--    mutate( -->
+<!--      width_group = cut(AvgWidthArea_1, breaks = c(0, 5,10, 15,20, 30,40,50,60)), -->
+<!--      width_midpoints =midpoints[as.numeric(width_group)] -->
+<!--    ) %>%  -->
+<!--   pivot_longer(cols= c(condition_indicators[-5],  -->
+<!--       cover_indicators), values_to = 'field_value',names_to='field_indicators') %>%  -->
+<!--   filter(field_indicators %in% condition_indicators ) %>%  -->
+<!--   filter( -->
+<!--     cln_metric_name %in%  -->
+<!--       c('NDVI: Late Season','MVP: Late Season','RRI: 5 year','NDVI: Seasonal Difference') -->
+<!--   ) %>%  -->
+<!--   group_by(width_midpoints,cln_metric_name, field_indicators) %>%  -->
+<!--   summarise(cor=cor(rs_value, field_value, method='spearman',  use = "pairwise.complete.obs")) -->
+
+<!-- p<- cor_by_width %>%  -->
+<!--   ggplot(aes(width_midpoints,cor))+ -->
+<!--   geom_point()+ -->
+<!--   geom_smooth(span=1, se= FALSE)+ -->
+<!--   facet_grid(cols=vars(cln_metric_name), rows= vars(field_indicators),scales='free')+ -->
+<!--   #coord_cartesian(ylim = c(-1,1))+ -->
+<!--   theme_bw()+ -->
+<!--   theme(axis.text.x = element_text(angle = 90)) -->
+
+<!-- p %>% ggsave('AIM_RW/figures/v2/rs_field_correlation_by_width_sel_conditions.png',.,width=10, height=10) -->
+
+<!-- cor_by_width<- dat_joined %>%  -->
+<!--   left_join(rw_plots) %>%  -->
+<!--    mutate( -->
+<!--      width_group = cut(AvgWidthArea_1, breaks = c(0, 5,10, 15,20, 30,40,50,60)), -->
+<!--      width_midpoints =midpoints[as.numeric(width_group)] -->
+<!--    ) %>%  -->
+<!--   pivot_longer(cols= c(condition_indicators[-3],  -->
+<!--       cover_indicators), values_to = 'field_value',names_to='field_indicators') %>%  -->
+<!--   filter(field_indicators %in% cover_indicators ) %>%  -->
+<!--   filter( -->
+<!--     cln_metric_name %in%  -->
+<!--       c('NDVI Late Season','MVP Growing Season','NDVI Seasonal Difference','RRI - 5 year','NDVI 5-yr StdDev Late Season') -->
+<!--   ) %>%  -->
+<!--   group_by(width_midpoints,cln_metric_name, field_indicators) %>%  -->
+<!--   summarise(cor=cor(rs_value, field_value, method='spearman',  use = "pairwise.complete.obs")) -->
+
+<!-- p<- cor_by_width %>%  -->
+<!--   ggplot(aes(width_midpoints,cor))+ -->
+<!--   geom_point()+ -->
+<!--   geom_smooth(span=1, se= FALSE)+ -->
+<!--   facet_grid(cols=vars(cln_metric_name), rows= vars(field_indicators),scales='free')+ -->
+<!--  # coord_cartesian(ylim = c(-.5,.5))+ -->
+<!--   theme_bw()+ -->
+<!--   theme(axis.text.x = element_text(angle = 90)) -->
+
+<!-- p %>% ggsave('AIM_RW/figures/v2/rs_field_correlation_by_width_sel_cover.png',.,width=10, height=10) -->
+<!-- ``` -->
+
+
+# Cross Correlations
+
+## all data
+```{r}
+dat_wide_joined_abv10 <- indicators_cln %>% 
+  #filter(StateCode == 'NV') %>% 
+  inner_join(rs_cln_wide ) %>% 
+  left_join(rw_plots) %>% 
+  filter(AvgWidthArea_1>10)
+
+cor_matrix<- dat_wide_joined_abv10 %>% 
+  dplyr::select(
+    c(condition_indicators[-5], 
+      cover_indicators, 
+      as.character(rs_cln_lng$cln_metric_name %>% unique(.)))
+  ) %>% 
+  cor(., use='pairwise.complete.obs', method='spearman')
+
+aim_indicators <- colnames(cor_matrix)[1:11]
+rs_metrics <- colnames(cor_matrix)[12:29]
+
+# Extract the AIM-RS correlation submatrix
+aim_rs_cor <- cor_matrix[aim_indicators, rs_metrics]
+
+# Convert to long format for ggplot
+cor_long <- aim_rs_cor %>%
+  as.data.frame() %>%
+  rownames_to_column("aim_var") %>%
+  pivot_longer(-aim_var, names_to = "rs_var", values_to = "correlation")
+
+# Add grouping variables for faceting
+cor_long <- cor_long %>%
+  mutate(
+    # AIM group (y-axis facet)
+    aim_group = case_when(
+      aim_var %in% condition_indicators ~ "Condition Indicators",
+      aim_var %in% cover_indicators ~ "Cover Indicators",
+      TRUE ~ "Other"
+    )
+  ) %>% 
+  left_join(rs_data_name_lkup %>% dplyr::select(rs_var=cln_metric_name,rs_metric_type= metric_type))
+
+# Create a custom text formatting function to show correlations
+text_color <- function(corr) {
+  case_when(
+    corr > 0.25 ~ "#053061", 
+    corr <= 0.25 & corr >= 0 ~"#92c5de", 
+    corr >= -0.25 & corr < 0 ~ "#f4a582",
+    corr < -0.25 ~ "#67001f")
+}
+
+# Create the faceted correlation plot
+p_cross<- ggplot(cor_long, aes(x = rs_var, y = fct_rev(aim_var))) +
+  # Correlation visualization
+  geom_tile(aes(fill = correlation), color = "white", linewidth = 0.2) +
+  geom_text(aes(label = sprintf("%.2f", correlation), 
+                color = text_color(correlation)),
+            size = 3) +
+  
+  # Custom scales
+  scale_fill_gradient2(
+    low = "#D73027", mid = "white", high = "#4575B4", 
+    midpoint = 0, limits = c(-1, 1)
+  ) +
+  scale_color_identity() +
+  
+  # Faceting
+  facet_grid(
+    aim_group ~ rs_metric_type,
+    scales = "free", 
+    space = "free",
+    switch = "y"
+  ) +
+  
+  # Theme customization
+  theme_minimal() +
+  theme(
+    # Panel styling
+    panel.border = element_rect(color = "grey80", fill = NA),
+    panel.grid = element_blank(),
+    panel.spacing = unit(0.3, "lines"),
+    
+    # Facet styling
+    strip.background = element_rect(fill = "#5b7fa3", color = "white"),
+    strip.text = element_text(color = "white", face = "bold", size = 10),
+    strip.placement = "outside",
+    
+    # Axis styling
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1, size = 8),
+    axis.text.y = element_text(size = 8),
+    axis.title = element_text(size = 11, face = "bold"),
+    
+    # Legend
+    legend.position = "top",
+    legend.title = element_text(size = 9),
+    legend.text = element_text(size = 8),
+    legend.key.height = unit(0.8, "lines"),
+    
+    # Plot styling
+    plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = 10, hjust = 0.5),
+    plot.margin = margin(15, 15, 15, 15)
+  ) +
+  
+  # Labels
+  labs(
+    title = "Correlations Between AIM Field Indicators and Remote Sensing Metrics",
+   # subtitle = "Correlations with absolute value < 0.3 are not displayed",
+    x = "Remote Sensing Metrics",
+    y = "AIM Field Indicators",
+    fill = "Correlation"
+  )
+
+
+p_cross %>% ggsave('AIM_RW/figures/v2/rs_field_correlation_abv10m.png',.,width=14, height=8)
+```
+
+
+# Quick Regression Modelings
+
+```{r}
+dat_wide_joined_abv10 %>% 
+  lm(data=.,AH_HydroNoFACCover~ Elevation_m+ `MVP Late Season` +`NDVI Late Season` + `NDWI Late Season`+ `NDVI Early Season`+`NDWI Early Season`+ `NDVI Seasonal Difference`+`NDVI 5-yr StdDev Late Season`+`NDWI 5-yr StdDev Late Season`+`RRI - 10 year`) %>% 
+  summary(.)
+
+dat_wide_joined_abv10 %>% 
+  mutate(combo =  `NDVI Late Season` * (`NDVI 5-yr StdDev Late Season`)) %>% 
+  lm(data=.,FH_WoodyCover~ `NDVI Late Season` +`NDVI 5-yr StdDev Late Season`+
+      combo+`RRI - 10 year`) %>% 
+  summary(.)
+
+library(mgcv)
+
+rw_plots %>% 
+  as_tibble() %>% 
+  group_by(PlotLayout) %>% 
+  tally()
+
+rw_plots %>% 
+  as_tibble() %>% 
+  group_by(PlotLayout) %>% 
+    filter(AvgWidthArea_1>10) %>% 
+  tally()
+
+
+dat_wide_joined_abv10 <- indicators_cln %>% 
+  #filter(StateCode == 'NV') %>% 
+  inner_join(rs_cln_wide ) %>% 
+  left_join(rw_plots) %>% 
+  filter(AvgWidthArea_1>10)
+
+# Replace spaces with underscores in all column names
+names(dat_wide_joined_abv10) <- gsub(" ", "_", names(dat_wide_joined_abv10))
+
+# Also replace hyphens with underscores for consistency
+names(dat_wide_joined_abv10) <- gsub("-", "_", names(dat_wide_joined_abv10))
+
+# Check the new column names
+head(names(dat_wide_joined_abv10))
+
+
+dat_wide_joined_abv10 <- indicators_cln %>% 
+  #filter(StateCode == 'NV') %>% 
+  inner_join(rs_cln_wide ) %>% 
+  left_join(rw_plots) %>% 
+  filter(AvgWidthArea_1>10)
+
+# Replace spaces with underscores in all column names
+names(dat_wide_joined_abv10) <- gsub(" ", "_", names(dat_wide_joined_abv10))
+# Also replace hyphens with underscores for consistency
+names(dat_wide_joined_abv10) <- gsub("-", "_", names(dat_wide_joined_abv10))
+
+
+dat_wide_joined_abv10 <- dat_wide_joined_abv10%>% 
+  dplyr::select(AH_HydroNoFACCover,TotalFoliarCover,AH_HydroFACCover, Elevation_m,MVP_Late_Season,NDVI_Late_Season,
+                NDWI_Late_Season,NDVI_Early_Season,NDWI_Early_Season,NDVI_Seasonal_Difference,
+                NDVI_5_yr_StdDev_Late_Season,NDWI_5_yr_StdDev_Late_Season,RRI___10_year) %>% 
+  drop_na()
+
+
+# Now run the GAM model with updated variable names
+gam_model <- gam(AH_HydroFACCover ~ 
+                 s(Elevation_m) + 
+                 s(MVP_Late_Season) + 
+                 s(NDVI_Late_Season) + 
+                 s(NDWI_Late_Season) + 
+                 s(NDVI_Early_Season) + 
+                 s(NDWI_Early_Season) + 
+                 s(NDVI_Seasonal_Difference) + 
+                 s(NDVI_5_yr_StdDev_Late_Season) + 
+                 s(NDWI_5_yr_StdDev_Late_Season) + 
+                 s(RRI___10_year), 
+                 data = dat_wide_joined_abv10)
+
+summary(gam_model)
+
+
+library(randomForest)
+
+
+# Set seed for reproducibility
+set.seed(123)
+
+# Fit a random forest model
+rf_model <- randomForest(
+  AH_HydroFACCover ~ Elevation_m + 
+                       MVP_Late_Season + 
+                       NDVI_Late_Season + 
+                       NDWI_Late_Season + 
+                       NDVI_Early_Season + 
+                       NDWI_Early_Season + 
+                       NDVI_Seasonal_Difference + 
+                       NDVI_5_yr_StdDev_Late_Season + 
+                       NDWI_5_yr_StdDev_Late_Season + 
+                       RRI___10_year,
+  data = dat_wide_joined_abv10,
+  ntree = 500,           # Number of trees
+  mtry = 3,              # Number of variables to try at each split (default for regression is p/3)
+  importance = TRUE      # Calculate variable importance
+)
+
+# Print the model
+print(rf_model)
+
+# Plot variable importance
+varImpPlot(rf_model, main = "Variable Importance")
+
+# Get percentage of variance explained
+cat("Percent Variance Explained:", round(rf_model$rsq[length(rf_model$rsq)] * 100, 2), "%\n")
+
+# Plot observed vs predicted values
+plot(dat_wide_joined_abv10$AH_HydroNoFACCover, predict(rf_model), 
+     xlab = "Observed", ylab = "Predicted", 
+     main = "Observed vs Predicted Values")
+abline(0, 1, col = "red")
+```
+
+
+# RS-AIM scatterplots
+
+```{r}
+plot_remote_sensing_relationships <- function(data, 
+                                             predictor_vars, 
+                                             response_vars, 
+                                             response_name, 
+                                             width = 10, 
+                                             height = 8) 
+{
+  # Load purrr for map function
+  require(purrr)
+  
+  # Create directory if it doesn't exist
+  dir.create("AIM_RW/figures/v2/scatterplots/", recursive = TRUE, showWarnings = FALSE)
+  
+  # Use map to iterate through predictor variables
+  plot_list <- map(predictor_vars, function(pred_var) {
+    
+    # Reshape data to long format for faceting
+    plot_data <- data %>%
+      select(all_of(c(pred_var, response_vars))) %>%
+      pivot_longer(cols = all_of(response_vars),
+                   names_to = "response",
+                   values_to = "response_value")
+    
+    # Calculate Spearman correlations for each response variable
+    cor_data <- data.frame(response = character(), correlation = numeric())
+    
+    for(resp in response_vars) {
+      cor_val <- cor(data[[pred_var]], data[[resp]], 
+                    method = "spearman", use = "pairwise.complete.obs")
+      cor_data <- rbind(cor_data, data.frame(response = resp, 
+                                            correlation = cor_val))
+    }
+    
+    # Create the plot - using aes() for handling spaces in variable names
+    p <- ggplot(plot_data, aes(x = .data[[pred_var]], y = response_value)) +
+      geom_point(alpha = 0.5) +
+      geom_smooth(method = "lm", se = TRUE, color = "blue", fill = "blue", alpha = 0.2) +
+      geom_smooth(method = "loess", se = TRUE, color = "red", fill = "red", alpha = 0.2) +
+      facet_wrap(~ response, scales = "free_y") +
+      labs(
+        title = paste("Relationship between", pred_var, "and", response_name),
+        x = pred_var,
+        y = "Response Variable Value"
+      ) +
+      theme_bw() +
+      theme(
+        strip.background = element_rect(fill = "lightgrey"),
+        strip.text = element_text(face = "bold"),
+        axis.title = element_text(face = "bold"),
+        plot.title = element_text(hjust = 0.5, face = "bold")
+      )+
+      coord_cartesian(ylim = c(0,100))
+    
+    # Add correlation text to each facet
+    p <- p + geom_text(
+      data = cor_data,
+      aes(x = -Inf, y = Inf, 
+          label = sprintf("ρ = %.2f", correlation)),
+      hjust = -0.1,
+      vjust = 1.5,
+      size = 3.5,
+      inherit.aes = FALSE
+    )
+    
+    # Save the plot
+    output_path = paste0('AIM_RW/figures/v2/scatterplots/', 
+                         gsub(" ", "_", pred_var), '_',
+                         gsub(" ", "_", response_name), '.png')
+    ggsave(output_path, p, width = width, height = height)
+    
+    # Return the plot object
+    return(p)
+  })
+  
+  # Name the plot list with predictor variables
+  names(plot_list) <- predictor_vars
+  
+  # Return the list of plots
+  return(plot_list)
+}
+
+
+dat_wide_joined_abv10 <- indicators_cln %>% 
+  #filter(StateCode == 'NV') %>% 
+  inner_join(rs_cln_wide ) %>% 
+  left_join(rw_plots) %>% 
+  filter(AvgWidthArea_1>10)
+
+all_cover_plots <- plot_remote_sensing_relationships(
+  data = dat_wide_joined_abv10,
+  predictor_vars = names(dat_wide_joined_abv10)[26:43],
+  response_vars = cover_indicators,
+  response_name = "AIM Cover Indicators"
+)
+
+all_conditions_plots <- plot_remote_sensing_relationships(
+  data = dat_wide_joined_abv10,
+  predictor_vars = names(dat_wide_joined_abv10)[26:43],
+  response_vars = condition_indicators[-3],
+  response_name = "AIM Condition Indicators"
+)
+
+
+
+
+plot_remote_sensing_relationships(
+  data = dat_wide_joined_abv10,
+  response_vars = condition_indicators[-3],
+  response_name = 'AIM Condition Indicators',
+  predictor_var ="NDVI Late Season",
+ # output_path = "ndvi_relationships.png"
+)
+
+plot_remote_sensing_relationships(
+  data = dat_wide_joined_abv10,
+  response_vars = cover_indicators,
+  response_name = 'AIM Cover Indicators',
+  predictor_var ="NDVI Late Season",
+ # output_path = "ndvi_relationships.png"
+)
+
+```
+
+
+# Productivity vs Sensitivity (std dev)
+
+# Condi
+
+```{r}
+
+dat_wide_joined_abv10 %>% 
+  ggplot(aes(`NDVI Late Season`,`NDVI 5-yr StdDev Late Season`  ))+
+    geom_point(aes(fill=AH_HydroWithFACCover),shape=21,size=4,alpha=0.7)+
+  scale_fill_viridis_c()+
+  theme_bw()
+
+dat_wide_joined_abv10 %>% 
+  ggplot(aes(`NDVI Late Season`,`NDVI 5-yr StdDev Late Season`  ))+
+    geom_point(aes(fill=AH_HydroNoFACCover),shape=21,size=4,alpha=0.7)+
+  scale_fill_viridis_c()+
+  theme_bw()
+
+dat_wide_joined_abv10 %>% 
+  ggplot(aes(`NDVI Late Season`,`NDVI 5-yr StdDev Late Season`  ))+
+    geom_point(aes(fill=FH_WoodyCover),shape=21,size=4,alpha=0.7)+
+  scale_fill_viridis_c()+
+  theme_bw()
+
+
+dat_wide_joined_abv10 %>% 
+  ggplot(aes(`NDVI Late Season`,`NDVI 5-yr StdDev Late Season`  ))+
+  geom_smooth(color='red',linetype='dashed',alpha=0.2)+
+  geom_point(aes(fill=FH_HERB),shape=21,size=4,alpha=0.7)+
+  scale_fill_viridis_c()+
+  theme_bw()
+
+dat_wide_joined_abv10 %>% 
+  ggplot(aes(`NDVI Late Season`,`NDVI 5-yr StdDev Late Season` ,fill=WetlandType ))+
+  #geom_smooth(color='red',linetype='dashed',alpha=0.2)+
+  geom_point(shape=21,size=4,alpha=0.7)+
+  stat_ellipse(geom = 'polygon',alpha=0.2, level=0.90)+
+  scale_fill_ptol()+
+  theme_bw()
+
+
+dat_wide_joined_abv10 %>% 
+  ggplot(aes(`NDVI Late Season`,`NDVI 5-yr StdDev Late Season`,
+             fill=LPI_SiteWetlandRating_CWM ))+
+  #geom_smooth(color='red',linetype='dashed',alpha=0.2)+
+  geom_point(shape=21,size=4,alpha=0.7)+
+  stat_ellipse(geom = 'polygon',alpha=0.2, level=0.90)+
+  scale_fill_ptol()+
+  theme_bw()
+
+```
+
+# Late Season NDVI - RRI 10yr
+```{r}
+dat_wide_joined_abv10 %>% 
+  ggplot(aes(`NDVI Late Season`,`RRI - 10 year` ))+
+    geom_point(aes(fill=Elevation_m),shape=21,size=4,alpha=0.7)+
+  scale_fill_viridis_c()+
+  theme_bw()
+
+dat_wide_joined_abv10 %>% 
+  ggplot(aes(`NDVI Late Season`,`RRI - 10 year` ))+
+    geom_point(aes(fill=AH_HydroNoFACCover),shape=21,size=4,alpha=0.7)+
+  scale_fill_viridis_c()+
+  theme_bw()
+
+dat_wide_joined_abv10 %>% 
+  ggplot(aes(`NDVI Late Season`,`RRI - 10 year` ))+
+    geom_point(aes(fill=AH_HydroWithFACCover),shape=21,size=4,alpha=0.7)+
+  scale_fill_viridis_c()+
+  theme_bw()
+
+dat_wide_joined_abv10 %>% 
+  ggplot(aes(`NDVI Late Season`,`RRI - 10 year`  ))+
+    geom_point(aes(fill=LPI_SiteWetlandValue_CWM),shape=21,size=4,alpha=0.7)+
+  scale_fill_viridis_c()+
+  theme_bw()
+
+dat_wide_joined_abv10 %>% 
+  ggplot(aes(`NDVI Late Season`,`RRI - 10 year`  ))+
+    geom_point(aes(fill=FH_HERB),shape=21,size=4,alpha=0.7)+
+  scale_fill_viridis_c()+
+  theme_bw()
+
+dat_wide_joined_abv10 %>% 
+  ggplot(aes(`NDVI Late Season`,`RRI - 10 year`  ))+
+    geom_point(aes(fill=FH_WoodyCover),shape=21,size=4,alpha=0.7)+
+  scale_fill_viridis_c()+
+  theme_bw()
+
+dat_wide_joined_abv10 %>% 
+  ggplot(aes(`NDVI Late Season`,`RRI - 10 year`,
+             fill=WetlandType ))+
+  #geom_smooth(color='red',linetype='dashed',alpha=0.2)+
+  geom_point(shape=21,size=4,alpha=0.7)+
+  stat_ellipse(geom = 'polygon',alpha=0.2, level=0.90)+
+  scale_fill_ptol()+
+  theme_bw()
+
+dat_wide_joined_abv10 %>% 
+  ggplot(aes(`NDVI Late Season`,`RRI - 10 year`,
+             fill=LPI_SiteWetlandRating_CWM ))+
+  #geom_smooth(color='red',linetype='dashed',alpha=0.2)+
+  geom_point(shape=21,size=4,alpha=0.7)+
+  stat_ellipse(geom = 'polygon',alpha=0.2, level=0.90)+
+  scale_fill_ptol()+
+  theme_bw()
+
+```
+
+```{r}
+
+dat_wide_joined_abv10 %>% 
+  ggplot(aes(`NDVI Late Season`,`NDVI Seasonal Difference`  ))+
+    geom_point(aes(fill=FH_WoodyCover),shape=21,size=4,alpha=0.7)+
+  scale_fill_viridis_c()+
+  theme_bw()
+
+dat_wide_joined_abv10 %>% 
+  ggplot(aes(`NDVI Late Season`,`NDVI Seasonal Difference`  ))+
+    geom_point(aes(fill=AH_HydroNoFACCover),shape=21,size=4,alpha=0.7)+
+  scale_fill_viridis_c()+
+  theme_bw()
+
+dat_wide_joined_abv10 %>% 
+  ggplot(aes(`NDVI Late Season`,`NDVI Seasonal Difference`  ))+
+    geom_point(aes(fill=AH_HydroWithFACCover),shape=21,size=4,alpha=0.7)+
+  scale_fill_viridis_c()+
+  theme_bw()
+
+dat_wide_joined_abv10 %>% 
+  ggplot(aes(`NDVI Late Season`,`NDVI Seasonal Difference`,
+             fill=WetlandType ))+
+  #geom_smooth(color='red',linetype='dashed',alpha=0.2)+
+  geom_point(shape=21,size=4,alpha=0.7)+
+  stat_ellipse(geom = 'polygon',alpha=0.2, level=0.90)+
+  scale_fill_ptol()+
+  theme_bw()
+
+dat_wide_joined_abv10 %>% 
+  ggplot(aes(`NDVI Late Season`,`NDVI Seasonal Difference`,
+             fill=LPI_SiteWetlandRating_CWM ))+
+  #geom_smooth(color='red',linetype='dashed',alpha=0.2)+
+  geom_point(shape=21,size=4,alpha=0.7)+
+  stat_ellipse(geom = 'polygon',alpha=0.2, level=0.90)+
+  scale_fill_ptol()+
+  theme_bw()
+
+dat_wide_joined_abv10 %>% 
+  ggplot(aes(`NDVI Late Season`,`NDVI Seasonal Difference`,
+             fill=LPI_SiteWetlandRating_CWM ))+
+  #geom_smooth(color='red',linetype='dashed',alpha=0.2)+
+  geom_point(shape=21,size=4,alpha=0.7)+
+  stat_ellipse(geom = 'polygon',alpha=0.2, level=0.90)+
+  scale_fill_ptol()+
+  theme_bw()
+
+```
+
+
+
+
+
+# Relationship between RS Indicator and Key indicators by plot layout type /width (scatter?) 
+
+
+
+
+
+
+```{r}
+
+## NDVI
+
+### Primary Indicators
+```{r}
+choose_metric <-  'ndvi'
+
+p_ndvi_scat_seas <- dat_joined %>% 
+  filter(metric == choose_metric) %>% 
+  pivot_longer(cols = c(primary_indicators[-3]), names_to = 'primary_indicators', values_to = 'field_value') %>% 
+  ggplot(aes(value, field_value, color = season)) +
+    geom_point() +
+    facet_grid(cols = vars(primary_indicators)) +
+    geom_smooth() +
+    #geom_smooth(method='lm',color='yellow') +
+    stat_cor(label.y = c(115, 105, 95, 85)) +  # Staggered positions for different seasons
+    theme_bw() +
+    scale_color_ptol() +
+    labs(x = choose_metric, 
+         y = 'Percent Cover', 
+         title = paste0('Seasonal ', choose_metric, ' vs Field-Based Condition Indicators'), 
+         subtitle = 'All Plots in Nevada.') +
+    coord_cartesian(ylim = c(0, 120)) +
+    scale_y_continuous(breaks = seq(0, 100, 25))
+
+p_ndvi_scat_seas %>% ggsave('AIM_RW/figures/v1_extended/nevada_scat_ndvi_prim_by_season.png',.,width=12,height=4)
+
+p_ndvi_jas_scat_layout <- dat_joined%>% 
+  filter( metric== choose_metric,season=='jas') %>% 
+  pivot_longer(cols=c(primary_indicators[-3]), names_to = 'primary_indicators',values_to = 'field_value') %>% 
+  ggplot(aes(value,field_value,color=season))+
+    geom_point()+
+    facet_grid(cols=vars(primary_indicators), rows=vars(PlotLayout))+
+    geom_smooth()+
+    geom_smooth(method='lm',color='yellow')+
+    stat_cor(method='spearman',cor.coef.name='rho', label.y = c(105, 115, 95, 85))+
+    theme_bw()+
+    scale_color_few()+
+    labs(x= choose_metric,y='Percent Cover', title= paste0('Summer', choose_metric,' vs Field-Based Condition Indicators By Plot Layout'), subtitle = 'All Plots in Nevada ')+
+    coord_cartesian(ylim = c(0, 110)) +
+    scale_y_continuous(breaks = seq(0, 100, 25))
+
+p_ndvi_jas_scat_layout %>% ggsave('AIM_RW/figures/v1_extended/nevada_scat_ndvijas_prim_by_layout.png',.,width=12,height=10)
+
+
+p_ndvi_cor_by_layout<- dat_joined %>% 
+  rename(rs_value = value) %>% 
+  filter(metric == choose_metric, season == 'jas') %>% 
+  dplyr::select(all_of(c('PlotLayout', primary_indicators[-3], 'rs_value'))) %>% 
+  pivot_longer(primary_indicators[-3], names_to = 'field_names') %>% 
+  group_by(PlotLayout, field_names) %>% 
+  summarise(cor = cor(rs_value, value, method = 'spearman'), .groups = 'drop') %>% 
+  # Create a heatmap with text values - text color varies based on cell darkness
+  ggplot(aes(x = field_names, y = PlotLayout, fill = cor)) +
+  # Add tiles for the heatmap
+  geom_tile(color = "white", linewidth = 0.5) +
+  # Add text showing correlation values with conditional coloring
+  geom_text(aes(label = sprintf("%.2f", cor), 
+                color = ifelse(abs(cor) > 0.5, "white", "black"))) +
+  scale_fill_gradient2(limits=c(-1,1))+
+  # Set text colors
+  scale_color_identity() +
+  # Improve the appearance
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid = element_blank(),
+    legend.position = "right"
+  ) +
+  labs(
+    x = "Indicator Names",
+    y = "Plot Layout",
+    title = "Spearman Correlation for\nSummer NDVI-Field Indicator"
+  ) +
+  # Ensure the cells are square
+  coord_fixed()
+p_ndvi_cor_by_layout %>% ggsave('AIM_RW/figures/v1_extended/nevada_cor_ndvijas_prim_by_layout.png',.,width=6,height=5)
+```
+
+##
+
+
+
+### Secondary Indicators
+```{r}
+choose_metric <-  'ndvi'
+
+p_ndvi_scat_seas <- dat_joined %>% 
+  filter(metric == choose_metric) %>% 
+  pivot_longer(cols = c(secondary_indicators), names_to = 'secondary_indicators', values_to = 'field_value') %>% 
+  ggplot(aes(value, field_value, color = season)) +
+    geom_point() +
+    facet_grid(cols = vars(secondary_indicators)) +
+    geom_smooth() +
+    #geom_smooth(method='lm',color='yellow') +
+    stat_cor(label.y = c(115, 105, 95, 85)) +  # Staggered positions for different seasons
+    theme_bw() +
+    scale_color_ptol() +
+    labs(x = choose_metric, 
+         y = 'Percent Cover', 
+         title = paste0('Seasonal ', choose_metric, ' vs Field-Based Condition Indicators'), 
+         subtitle = 'All Plots in Nevada.') +
+    coord_cartesian(ylim = c(0, 120)) +
+    scale_y_continuous(breaks = seq(0, 100, 25))
+
+p_ndvi_scat_seas %>% ggsave('AIM_RW/figures/v1_extended/nevada_scat_ndvi_secondary_by_season.png',.,width=12,height=4)
+
+p_ndvi_jas_scat_layout <- dat_joined%>% 
+  filter( metric== choose_metric,season=='jas') %>% 
+  pivot_longer(cols=c(secondary_indicators), names_to = 'secondary_indicators',values_to = 'field_value') %>% 
+  ggplot(aes(value,field_value,color=season))+
+    geom_point()+
+    facet_grid(cols=vars(secondary_indicators), rows=vars(PlotLayout))+
+    geom_smooth()+
+    geom_smooth(method='lm',color='yellow')+
+    stat_cor(method='spearman',cor.coef.name='rho', label.y = c(105, 115, 95, 85))+
+    theme_bw()+
+    scale_color_few()+
+    labs(x= choose_metric,y='Percent Cover', title= paste0('Summer ', choose_metric,' vs Field-Based Condition Indicators By Plot Layout'), subtitle = 'All Plots in Nevada ')+
+    coord_cartesian(ylim = c(0, 110)) +
+    scale_y_continuous(breaks = seq(0, 100, 25))
+
+p_ndvi_jas_scat_layout %>% ggsave('AIM_RW/figures/v1_extended/nevada_scat_ndvijas_secondary_by_layout.png',.,width=12,height=10)
+
+
+p_ndvi_cor_by_layout<- dat_joined %>% 
+  rename(rs_value = value) %>% 
+  filter(metric == choose_metric, season == 'jas') %>% 
+  dplyr::select(all_of(c('PlotLayout', secondary_indicators, 'rs_value'))) %>% 
+  pivot_longer(secondary_indicators, names_to = 'field_names') %>% 
+  group_by(PlotLayout, field_names) %>% 
+  summarise(cor = cor(rs_value, value, method = 'spearman'), .groups = 'drop') %>% 
+  # Create a heatmap with text values - text color varies based on cell darkness
+  ggplot(aes(x = field_names, y = PlotLayout, fill = cor)) +
+  # Add tiles for the heatmap
+  geom_tile(color = "white", linewidth = 0.5) +
+  # Add text showing correlation values with conditional coloring
+  geom_text(aes(label = sprintf("%.2f", cor), 
+                color = ifelse(abs(cor) > 0.5, "white", "black"))) +
+  scale_fill_gradient2(limits=c(-1,1))+
+  # Set text colors
+  scale_color_identity() +
+  # Improve the appearance
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid = element_blank(),
+    legend.position = "right"
+  ) +
+  labs(
+    x = "Indicator Names",
+    y = "Plot Layout",
+    title = "Spearman Correlation for\nSummer NDVI-Field Indicator"
+  ) +
+  # Ensure the cells are square
+  coord_fixed()
+p_ndvi_cor_by_layout %>% ggsave('AIM_RW/figures/v1_extended/nevada_cor_ndvijas_secondary_by_layout.png',.,width=6,height=5)
+```
+
+## NDWI
+
+### Primary Indicators
+
+```{r}
+choose_metric <-  'ndwi'
+
+p_ndwi_scat_seas <- dat_joined %>% 
+  filter(metric == choose_metric) %>% 
+  pivot_longer(cols = c(primary_indicators[-3]), names_to = 'primary_indicators', values_to = 'field_value') %>% 
+  ggplot(aes(value, field_value, color = season)) +
+    geom_point() +
+    facet_grid(cols = vars(primary_indicators)) +
+    geom_smooth() +
+    #geom_smooth(method='lm',color='yellow') +
+    stat_cor(label.y = c(115, 105, 95, 85)) +  # Staggered positions for different seasons
+    theme_bw() +
+    scale_color_ptol() +
+    labs(x = choose_metric, 
+         y = 'Percent Cover', 
+         title = paste0('Seasonal ', choose_metric, ' vs Field-Based Condition Indicators'), 
+         subtitle = 'All Plots in Nevada.') +
+    coord_cartesian(ylim = c(0, 120)) +
+    scale_y_continuous(breaks = seq(0, 100, 25))
+
+p_ndwi_scat_seas %>% ggsave('AIM_RW/figures/v1_extended/nevada_scat_ndwi_prim_by_season.png',.,width=12,height=4)
+
+p_ndwi_jas_scat_layout <- dat_joined%>% 
+  filter( metric== choose_metric,season=='jas') %>% 
+  pivot_longer(cols=c(primary_indicators[-3]), names_to = 'primary_indicators',values_to = 'field_value') %>% 
+  ggplot(aes(value,field_value,color=season))+
+    geom_point()+
+    facet_grid(cols=vars(primary_indicators), rows=vars(PlotLayout))+
+    geom_smooth()+
+    geom_smooth(method='lm',color='yellow')+
+    stat_cor(method='spearman',cor.coef.name='rho', label.y = c(105, 115, 95, 85))+
+    theme_bw()+
+    scale_color_few()+
+    labs(x= choose_metric,y='Percent Cover', title= paste0('Summer ', choose_metric,' vs Field-Based Condition Indicators By Plot Layout'), subtitle = 'All Plots in Nevada ')+
+    coord_cartesian(ylim = c(0, 110)) +
+    scale_y_continuous(breaks = seq(0, 100, 25))
+
+p_ndwi_jas_scat_layout %>% ggsave('AIM_RW/figures/v1_extended/nevada_scat_ndwijas_prim_by_layout.png',.,width=12,height=10)
+
+
+p_ndwi_cor_by_layout<- dat_joined %>% 
+  rename(rs_value = value) %>% 
+  filter(metric == choose_metric, season == 'jas') %>% 
+  dplyr::select(all_of(c('PlotLayout', primary_indicators[-3], 'rs_value'))) %>% 
+  pivot_longer(primary_indicators[-3], names_to = 'field_names') %>% 
+  group_by(PlotLayout, field_names) %>% 
+  summarise(cor = cor(rs_value, value, method = 'spearman'), .groups = 'drop') %>% 
+  # Create a heatmap with text values - text color varies based on cell darkness
+  ggplot(aes(x = field_names, y = PlotLayout, fill = cor)) +
+  # Add tiles for the heatmap
+  geom_tile(color = "white", linewidth = 0.5) +
+  # Add text showing correlation values with conditional coloring
+  geom_text(aes(label = sprintf("%.2f", cor), 
+                color = ifelse(abs(cor) > 0.5, "white", "black"))) +
+  scale_fill_gradient2(limits=c(-1,1))+
+  # Set text colors
+  scale_color_identity() +
+  # Improve the appearance
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid = element_blank(),
+    legend.position = "right"
+  ) +
+  labs(
+    x = "Indicator Names",
+    y = "Plot Layout",
+    title = "Spearman Correlation for\nSummer NDWI-Field Indicator"
+  ) +
+  # Ensure the cells are square
+  coord_fixed()
+
+p_ndwi_cor_by_layout %>% ggsave('AIM_RW/figures/v1_extended/nevada_cor_ndwijas_prim_by_layout.png',.,width=6,height=5)
+
+```
+
+
+### Secondary Indicators
+```{r}
+choose_metric <-  'ndwi'
+
+p_ndwi_scat_seas <- dat_joined %>% 
+  filter(metric == choose_metric) %>% 
+  pivot_longer(cols = c(secondary_indicators), names_to = 'secondary_indicators', values_to = 'field_value') %>% 
+  ggplot(aes(value, field_value, color = season)) +
+    geom_point() +
+    facet_grid(cols = vars(secondary_indicators)) +
+    geom_smooth() +
+    #geom_smooth(method='lm',color='yellow') +
+    stat_cor(label.y = c(115, 105, 95, 85)) +  # Staggered positions for different seasons
+    theme_bw() +
+    scale_color_ptol() +
+    labs(x = choose_metric, 
+         y = 'Percent Cover', 
+         title = paste0('Seasonal ', choose_metric, ' vs Field-Based Condition Indicators'), 
+         subtitle = 'All Plots in Nevada.') +
+    coord_cartesian(ylim = c(0, 120)) +
+    scale_y_continuous(breaks = seq(0, 100, 25))
+
+p_ndwi_scat_seas %>% ggsave('AIM_RW/figures/v1_extended/nevada_scat_ndwi_secondary_by_season.png',.,width=12,height=4)
+
+p_ndwi_jas_scat_layout <- dat_joined%>% 
+  filter( metric== choose_metric,season=='jas') %>% 
+  pivot_longer(cols=c(secondary_indicators), names_to = 'secondary_indicators',values_to = 'field_value') %>% 
+  ggplot(aes(value,field_value,color=season))+
+    geom_point()+
+    facet_grid(cols=vars(secondary_indicators), rows=vars(PlotLayout))+
+    geom_smooth()+
+    geom_smooth(method='lm',color='yellow')+
+    stat_cor(method='spearman',cor.coef.name='rho', label.y = c(105, 115, 95, 85))+
+    theme_bw()+
+    scale_color_few()+
+    labs(x= choose_metric,y='Percent Cover', title= paste0('Summer ', choose_metric,' vs Field-Based Condition Indicators By Plot Layout'), subtitle = 'All Plots in Nevada ')+
+    coord_cartesian(ylim = c(0, 110)) +
+    scale_y_continuous(breaks = seq(0, 100, 25))
+
+p_ndwi_jas_scat_layout %>% ggsave('AIM_RW/figures/v1_extended/nevada_scat_ndwijas_secondary_by_layout.png',.,width=12,height=10)
+
+
+p_ndwi_cor_by_layout<- dat_joined %>% 
+  rename(rs_value = value) %>% 
+  filter(metric == choose_metric, season == 'jas') %>% 
+  dplyr::select(all_of(c('PlotLayout', secondary_indicators, 'rs_value'))) %>% 
+  pivot_longer(secondary_indicators, names_to = 'field_names') %>% 
+  group_by(PlotLayout, field_names) %>% 
+  summarise(cor = cor(rs_value, value, method = 'spearman'), .groups = 'drop') %>% 
+  # Create a heatmap with text values - text color varies based on cell darkness
+  ggplot(aes(x = field_names, y = PlotLayout, fill = cor)) +
+  # Add tiles for the heatmap
+  geom_tile(color = "white", linewidth = 0.5) +
+  # Add text showing correlation values with conditional coloring
+  geom_text(aes(label = sprintf("%.2f", cor), 
+                color = ifelse(abs(cor) > 0.5, "white", "black"))) +
+  scale_fill_gradient2(limits=c(-1,1))+
+  # Set text colors
+  scale_color_identity() +
+  # Improve the appearance
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid = element_blank(),
+    legend.position = "right"
+  ) +
+  labs(
+    x = "Indicator Names",
+    y = "Plot Layout",
+    title = "Spearman Correlation for\nSummer ndwi-Field Indicator"
+  ) +
+  # Ensure the cells are square
+  coord_fixed()
+p_ndwi_cor_by_layout %>% ggsave('AIM_RW/figures/v1_extended/nevada_cor_ndwijas_secondary_by_layout.png',.,width=6,height=5)
+```
+
+
+## NDVI (JAS - AMJ)
+
+### Primary Indicators
+```{r}
+choose_metric <-  'ndvi'
+
+p_ndvi_jas_apr_diff <- dat_joined %>% 
+  filter(metric == choose_metric) %>% 
+  pivot_wider(names_from = season, values_from = value) %>% 
+  mutate(jas_amj_diff = jas - amj) %>% 
+  pivot_longer(cols = c(primary_indicators[-3]), names_to = 'primary_indicators', values_to = 'field_value') %>% 
+  ggplot(aes(jas_amj_diff, field_value)) +
+    geom_point() +
+    facet_grid(cols = vars(primary_indicators)) +
+    geom_smooth() +
+    geom_smooth(method='lm',color='yellow') +
+    stat_cor(label.y = c(115, 105, 95, 85)) +  # Staggered positions for different seasons
+    theme_bw() +
+    scale_color_ptol() +
+    labs(x = choose_metric, 
+         y = 'Percent Cover', 
+         title = paste0('JAS - AMJ ', choose_metric, ' vs Field-Based Condition Indicators'), 
+         subtitle = 'All Plots in Nevada.') +
+    coord_cartesian(ylim = c(0, 120)) +
+    scale_y_continuous(breaks = seq(0, 100, 25))
+
+p_ndvi_jas_apr_diff %>% ggsave('AIM_RW/figures/v1_extended/nevada_scat_ndvi_jas_apr_diff.png',.,width=12,height=4)
+
+
+p_ndvi_jas_apr_diff <- dat_joined %>% 
+  filter(metric == choose_metric) %>% 
+  pivot_wider(names_from = season, values_from = value) %>% 
+  mutate(jas_amj_diff = jas - amj) %>% 
+  pivot_longer(cols = c(secondary_indicators), names_to = 'secondary_indicators', values_to = 'field_value') %>% 
+  ggplot(aes(jas_amj_diff, field_value)) +
+    geom_point() +
+    facet_grid(cols = vars(secondary_indicators)) +
+    geom_smooth() +
+    geom_smooth(method='lm',color='yellow') +
+    stat_cor(label.y = c(115, 105, 95, 85)) +  # Staggered positions for different seasons
+    theme_bw() +
+    scale_color_ptol() +
+    labs(x = choose_metric, 
+         y = 'Percent Cover', 
+         title = paste0('JAS - AMJ ', choose_metric, ' vs Field-Based Cover Indicators'), 
+         subtitle = 'All Plots in Nevada.') +
+    coord_cartesian(ylim = c(0, 120)) +
+    scale_y_continuous(breaks = seq(0, 100, 25))
+
+p_ndvi_jas_apr_diff %>% ggsave('AIM_RW/figures/v1_extended/nevada_scat_ndvi_jas_apr_diff_cover.png',.,width=12,height=4)
+
+
+```
+
+## RRI
+
+### Primary Indicators
+```{r}
+choose_metric <-  'rri_5year'
+
+p_ndvi_scat_seas <- dat_joined %>% 
+  filter(metric == choose_metric) %>% 
+  pivot_longer(cols = c(primary_indicators[-3]), names_to = 'primary_indicators', values_to = 'field_value') %>% 
+  ggplot(aes(value, field_value)) +
+    geom_point() +
+    facet_grid(cols = vars(primary_indicators)) +
+    geom_smooth() +
+    geom_smooth(method='lm',color='yellow') +
+    stat_cor(label.y = c(115, 105, 95, 85)) +  # Staggered positions for different seasons
+    theme_bw() +
+    scale_color_ptol() +
+    labs(x = choose_metric, 
+         y = 'Percent Cover', 
+         title = paste0('Seasonal ', choose_metric, ' vs Field-Based Condition Indicators'), 
+         subtitle = 'All Plots in Nevada.') +
+    coord_cartesian(ylim = c(0, 120)) +
+    scale_y_continuous(breaks = seq(0, 100, 25))
+
+p_ndvi_scat_seas %>% ggsave('AIM_RW/figures/v1_extended/nevada_scat_ndvi_prim_by_season.png',.,width=12,height=4)
+
+p_ndvi_jas_scat_layout <- dat_joined%>% 
+  filter( metric== choose_metric,season=='jas') %>% 
+  pivot_longer(cols=c(primary_indicators[-3]), names_to = 'primary_indicators',values_to = 'field_value') %>% 
+  ggplot(aes(value,field_value,color=season))+
+    geom_point()+
+    facet_grid(cols=vars(primary_indicators), rows=vars(PlotLayout))+
+    geom_smooth()+
+    geom_smooth(method='lm',color='yellow')+
+    stat_cor(method='spearman',cor.coef.name='rho', label.y = c(105, 115, 95, 85))+
+    theme_bw()+
+    scale_color_few()+
+    labs(x= choose_metric,y='Percent Cover', title= paste0('Summer', choose_metric,' vs Field-Based Condition Indicators By Plot Layout'), subtitle = 'All Plots in Nevada ')+
+    coord_cartesian(ylim = c(0, 110)) +
+    scale_y_continuous(breaks = seq(0, 100, 25))
+
+p_ndvi_jas_scat_layout %>% ggsave('AIM_RW/figures/v1_extended/nevada_scat_ndvijas_prim_by_layout.png',.,width=12,height=10)
+
+
+p_ndvi_cor_by_layout<- dat_joined %>% 
+  rename(rs_value = value) %>% 
+  filter(metric == choose_metric, season == 'jas') %>% 
+  dplyr::select(all_of(c('PlotLayout', primary_indicators[-3], 'rs_value'))) %>% 
+  pivot_longer(primary_indicators[-3], names_to = 'field_names') %>% 
+  group_by(PlotLayout, field_names) %>% 
+  summarise(cor = cor(rs_value, value, method = 'spearman'), .groups = 'drop') %>% 
+  # Create a heatmap with text values - text color varies based on cell darkness
+  ggplot(aes(x = field_names, y = PlotLayout, fill = cor)) +
+  # Add tiles for the heatmap
+  geom_tile(color = "white", linewidth = 0.5) +
+  # Add text showing correlation values with conditional coloring
+  geom_text(aes(label = sprintf("%.2f", cor), 
+                color = ifelse(abs(cor) > 0.5, "white", "black"))) +
+  scale_fill_gradient2(limits=c(-1,1))+
+  # Set text colors
+  scale_color_identity() +
+  # Improve the appearance
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid = element_blank(),
+    legend.position = "right"
+  ) +
+  labs(
+    x = "Indicator Names",
+    y = "Plot Layout",
+    title = "Spearman Correlation for\nSummer NDVI-Field Indicator"
+  ) +
+  # Ensure the cells are square
+  coord_fixed()
+p_ndvi_cor_by_layout %>% ggsave('AIM_RW/figures/v1_extended/nevada_cor_ndvijas_prim_by_layout.png',.,width=6,height=5)
+```
+
+
+
+### Secondary Indicators
+```{r}
+choose_metric <-  'rri_10year'
+
+p_ndvi_scat_seas <- dat_joined %>% 
+  filter(metric == choose_metric) %>% 
+  pivot_longer(cols = c(secondary_indicators), names_to = 'secondary_indicators', values_to = 'field_value') %>% 
+  ggplot(aes(value, field_value)) +
+    geom_point() +
+    facet_grid(cols = vars(secondary_indicators)) +
+    geom_smooth() +
+    geom_smooth(method='lm',color='yellow') +
+    stat_cor(label.y = c(115, 105, 95, 85)) +  # Staggered positions for different seasons
+    theme_bw() +
+    scale_color_ptol() +
+    labs(x = choose_metric, 
+         y = 'Percent Cover', 
+         title = paste0('Seasonal ', choose_metric, ' vs Field-Based Condition Indicators'), 
+         subtitle = 'All Plots in Nevada.') +
+    coord_cartesian(ylim = c(0, 120)) +
+    scale_y_continuous(breaks = seq(0, 100, 25))
+
+p_ndvi_scat_seas %>% ggsave('AIM_RW/figures/v1_extended/nevada_scat_ndvi_secondary_by_season.png',.,width=12,height=4)
+
+p_ndvi_jas_scat_layout <- dat_joined%>% 
+  filter( metric== choose_metric) %>% 
+  pivot_longer(cols=c(secondary_indicators), names_to = 'secondary_indicators',values_to = 'field_value') %>% 
+  ggplot(aes(value,field_value))+
+    geom_point()+
+    facet_grid(cols=vars(secondary_indicators), rows=vars(PlotLayout))+
+    geom_smooth()+
+    geom_smooth(method='lm',color='yellow')+
+    stat_cor(method='spearman',cor.coef.name='rho', label.y = c(105, 115, 95, 85))+
+    theme_bw()+
+    scale_color_few()+
+    labs(x= choose_metric,y='Percent Cover', title= paste0('Summer ', choose_metric,' vs Field-Based Condition Indicators By Plot Layout'), subtitle = 'All Plots in Nevada ')+
+    coord_cartesian(ylim = c(0, 110)) +
+    scale_y_continuous(breaks = seq(0, 100, 25))
+
+p_ndvi_jas_scat_layout %>% ggsave('AIM_RW/figures/v1_extended/nevada_scat_ndvijas_secondary_by_layout.png',.,width=12,height=10)
+
+
+p_ndvi_cor_by_layout<- dat_joined %>% 
+  rename(rs_value = value) %>% 
+  filter(metric == choose_metric, season == 'jas') %>% 
+  dplyr::select(all_of(c('PlotLayout', secondary_indicators, 'rs_value'))) %>% 
+  pivot_longer(secondary_indicators, names_to = 'field_names') %>% 
+  group_by(PlotLayout, field_names) %>% 
+  summarise(cor = cor(rs_value, value, method = 'spearman'), .groups = 'drop') %>% 
+  # Create a heatmap with text values - text color varies based on cell darkness
+  ggplot(aes(x = field_names, y = PlotLayout, fill = cor)) +
+  # Add tiles for the heatmap
+  geom_tile(color = "white", linewidth = 0.5) +
+  # Add text showing correlation values with conditional coloring
+  geom_text(aes(label = sprintf("%.2f", cor), 
+                color = ifelse(abs(cor) > 0.5, "white", "black"))) +
+  scale_fill_gradient2(limits=c(-1,1))+
+  # Set text colors
+  scale_color_identity() +
+  # Improve the appearance
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid = element_blank(),
+    legend.position = "right"
+  ) +
+  labs(
+    x = "Indicator Names",
+    y = "Plot Layout",
+    title = "Spearman Correlation for\nSummer NDVI-Field Indicator"
+  ) +
+  # Ensure the cells are square
+  coord_fixed()
+p_ndvi_cor_by_layout %>% ggsave('AIM_RW/figures/v1_extended/nevada_cor_ndvijas_secondary_by_layout.png',.,width=6,height=5)
+```
+
+
+
+## 
+
+
+# Test difference between first and AH
+```{r}
+indicators %>% 
+ dplyr::select(
+      EvaluationID, BareSoilCover, FH_WaterCover, AH_WaterCover,AH_AnnualCover,AH_TreeCover, AH_ShrubCover, AH_GraminoidCover,AH_WoodyCover=AH_Woody,AH_PFG,AH_HERB
+  ) %>% 
+  left_join(
+    RW_FHMetrics_2022_2023 %>% 
+      dplyr::select(EvaluationID,FH_ShrubCover,FH_TreeCover,FH_PerennialCover,FH_AnnualCover,FH_WoodyCover,FH_NonwoodyCover) %>% 
+      mutate(FH_PFG = FH_PerennialCover-FH_WoodyCover)
+  ) %>% 
+  pivot_longer(BareSoilCover:FH_PFG) %>% 
+  separate(name, into=c('Hit_Type','Var'), sep='_') %>% 
+  pivot_wider(values_from = value, names_from =Hit_Type ) %>% 
+  ggplot(aes(FH, AH))+geom_point()+
+  facet_wrap(~Var,scales='free_y')+
+  geom_abline(color='red')
+
+
+```
+
+
+# cross correlation approach
+
+```{r}
+
+cor_matrix_S2 <- s2_cln_wide %>% 
+  filter(PlotLayout %in% c('Spoke')) %>% 
+ #filter(spat_stat=='mean') %>% 
+  left_join(
+    indicators %>% 
+      mutate(year = year(mdy_hms(FieldEvalDate))) %>% 
+      dplyr::select(
+        EvaluationID,year,AH_BasalCover:BareOrganicMaterialCover)
+    ) %>% 
+    left_join(
+      RW_FHMetrics_2022_2023 %>% 
+        dplyr::select(EvaluationID,FH_ShrubCover,FH_TreeCover,FH_PerennialCover,FH_AnnualCover,FH_WoodyCover,FH_NonwoodyCover) %>% 
+        mutate(FH_PFG = FH_PerennialCover-FH_WoodyCover)
+    ) %>% 
+    dplyr::select(-EvaluationID,-year,-qaqc_flag,-PlotLayout) %>% 
+    cor(., use='pairwise.complete.obs')
+
+p_crosscor_S2<- cor_matrix_S2 %>% 
+    ggcorrplot::ggcorrplot(method='circle',lab = TRUE,
+               ggtheme = ggplot2::theme_dark(),insig = "blank",lab_size = 3,  pch = 6,  tl.cex =8)+
+ scale_x_discrete(limits = colnames(cor_matrix_S2)[25:67]) +
+  scale_y_discrete(limits = rownames(cor_matrix_S2)[1:24])+
+  labs(x='RAP Cover Fractions',y='AIM R&W Indicators')
+
+p_crosscor_S2 %>% ggsave('AIM_RW/figures/s2_corrplot_spoke_AH_FH.png',.,width=8, height=8)
+
+cor_matrix_S2 <- s2_cln_wide %>% 
+  filter(PlotLayout %in% c('Spoke')) %>% 
+ #filter(spat_stat=='mean') %>% 
+  left_join(
+    indicators %>% 
+      mutate(year = year(mdy_hms(FieldEvalDate))) %>% 
+      dplyr::select(
+        EvaluationID,year,SppInv_Richness_Cnt:NumSpp_PreferredForb, TotalFoliarCover,Co_Disturbances_Cnt,LPI_SiteWetlandValue_CWM:LPI_StabilityValue_CWM)
+    ) %>% 
+    dplyr::select(-EvaluationID,-year,-qaqc_flag,-PlotLayout) %>% 
+    cor(., use='pairwise.complete.obs')
+
+p_crosscor_S2<- cor_matrix_S2 %>% 
+    ggcorrplot::ggcorrplot(method='circle',lab = TRUE,
+               ggtheme = ggplot2::theme_dark(),insig = "blank",lab_size = 3,  pch = 6,  tl.cex =8)+
+ scale_x_discrete(limits = colnames(cor_matrix_S2)[25:45]) +
+  scale_y_discrete(limits = rownames(cor_matrix_S2)[1:24])+
+  labs(x='RAP Cover Fractions',y='AIM R&W Indicators')
+
+p_crosscor_S2 %>% ggsave('AIM_RW/figures/s2_corrplot_spoke_AH_FH.png',.,width=8, height=8)
+
+```
+
+## Scatter Plots 
+
+```{r}
+s2_spatmean %>% 
+  filter(PlotLayout %in% c('Spoke')) %>% 
+ left_join(
+    indicators %>% 
+      mutate(year = year(mdy_hms(FieldEvalDate))) %>% 
+      dplyr::select(
+        EvaluationID,year,TotalFoliarCover,AH_HydrophyteCover, AH_HydroFACCover,BareSoilCover)
+    ) %>% 
+  left_join(
+     RW_FHMetrics_2022_2023 %>% 
+        dplyr::select(EvaluationID,FH_WoodyCover,FH_NonwoodyCover)
+  ) %>% 
+  pivot_longer(cols=TotalFoliarCover:FH_NonwoodyCover, names_to = 'aim_indicator', values_to = 'aim_value') %>% 
+  filter(aim_indicator =='TotalFoliarCover' ) %>% 
+  dplyr::select(-interannual_sd) %>% 
+  pivot_longer(cols=c(sampling_year_value,interannual_mean),names_to = 'rs_period',values_to='rs_value') %>% 
+  mutate(season_metric = paste0(season,'_',metric)) %>% 
+  ggplot(aes(rs_value,aim_value))+
+    geom_point(shape=21, alpha=0.15)+
+    geom_smooth(se=FALSE,aes(color=rs_period))+
+    geom_smooth(method='lm',se=FALSE, linetype='dashed',aes(color=rs_period))+
+    ggpubr::stat_cor(aes(color=rs_period,label = paste(..rr.label.., ..p.label.., sep = "~`,`~")))+
+    facet_grid(cols=vars(season_metric), rows=vars(aim_indicator),scales ='free')+
+    scale_color_ptol()
+
+
+s2_spatmean %>% 
+  filter(PlotLayout %in% c('Spoke')) %>% 
+ left_join(
+    indicators %>% 
+      mutate(year = year(mdy_hms(FieldEvalDate))) %>% 
+      dplyr::select(
+        EvaluationID,year,TotalFoliarCover,AH_HydrophyteCover, AH_HydroFACCover,BareSoilCover)
+    ) %>% 
+  left_join(
+     RW_FHMetrics_2022_2023 %>% 
+        dplyr::select(EvaluationID,FH_WoodyCover,FH_NonwoodyCover)
+  ) %>% 
+  pivot_longer(cols=TotalFoliarCover:FH_NonwoodyCover, names_to = 'aim_indicator', values_to = 'aim_value') %>% 
+  dplyr::select(-interannual_mean,-sampling_year_value) %>% 
+  pivot_longer(cols=c(interannual_sd),names_to = 'rs_period',values_to='rs_value') %>% 
+  mutate(season_metric = paste0(season,'_',metric)) %>% 
+  ggplot(aes(rs_value,aim_value))+
+    geom_point(shape=21, alpha=0.3)+
+    geom_smooth(se=FALSE,aes(color=rs_period))+
+    geom_smooth(method='lm',se=FALSE, linetype='dashed',aes(color=rs_period))+
+    ggpubr::stat_cor(aes(color=rs_period))+
+    facet_grid(cols=vars(season_metric), rows=vars(aim_indicator),scales ='free')+
+    scale_color_ptol()
+```
+
+# Boxplots
+
+```{r}
+
+
+s2_spatmean %>% 
+  filter(PlotLayout %in% c('Spoke')) %>% 
+ left_join(
+    indicators %>% 
+      mutate(year = year(mdy_hms(FieldEvalDate))) %>% 
+      dplyr::select(
+        EvaluationID,year,CowardinAttribute,HGMClass, WetlandType,AdminState,LPI_SiteWetlandRating_CWM)
+    ) %>% 
+  pivot_longer(CowardinAttribute:LPI_SiteWetlandRating_CWM) %>% 
+  mutate(
+    season_metric = paste0(season,'_',metric),
+    combined =interannual_mean + (0.5)*interannual_sd ) %>% 
+  ggplot(aes(value, combined))+
+  geom_boxplot()+
+  facet_grid(cols=vars(name),rows=vars(season_metric),scales='free')+
+  theme(axis.text.x = element_text(angle=90, vjust=0.5))
+
+
+p<- s2_spatmean %>% 
+  filter(PlotLayout %in% c('Spoke')) %>% 
+ left_join(
+    indicators %>% 
+      mutate(year = year(mdy_hms(FieldEvalDate))) %>% 
+      dplyr::select(
+        EvaluationID,year,CowardinAttribute,HGMClass, WetlandType,AdminState,LPI_SiteWetlandRating_CWM)
+    ) %>% 
+ # pivot_longer(CowardinAttribute:LPI_SiteWetlandRating_CWM) %>% 
+  mutate(season_metric = paste0(season,'_',metric)) %>% 
+  filter(season_metric=='jas_ndvi') %>% 
+  ggplot(aes(interannual_mean, interannual_sd, fill=WetlandType))+
+    geom_point(shape=21)+
+  stat_ellipse(geom = "polygon",alpha=0.2)
+
+plotly::ggplotly(p)  
+
+p<- s2_spatmean %>% 
+  filter(PlotLayout %in% c('Spoke','Transverse')) %>% 
+ left_join(
+    indicators %>% 
+      mutate(year = year(mdy_hms(FieldEvalDate))) %>% 
+      dplyr::select(
+        EvaluationID,year,CowardinAttribute,HGMClass, WetlandType,AdminState,LPI_SiteWetlandRating_CWM)
+    ) %>% 
+ # pivot_longer(CowardinAttribute:LPI_SiteWetlandRating_CWM) %>% 
+  mutate(
+    season_metric = paste0(season,'_',metric),
+    combined =interannual_mean - (5)*interannual_sd ) %>%
+  filter(season_metric=='jas_ndvi') %>% 
+  ggplot(aes(WetlandType,combined, fill=WetlandType))+
+  geom_boxplot()
+
+p<- s2_spatmean %>% 
+#  filter(PlotLayout %in% c('Spoke','Transverse')) %>% 
+ left_join(
+    indicators %>% 
+      mutate(year = year(mdy_hms(FieldEvalDate))) %>% 
+      dplyr::select(
+        EvaluationID,year,CowardinAttribute,HGMClass, WetlandType,AdminState,LPI_SiteWetlandRating_CWM)
+    ) %>% 
+ # pivot_longer(CowardinAttribute:LPI_SiteWetlandRating_CWM) %>% 
+  mutate(
+    season_metric = paste0(season,'_',metric),
+    combined =interannual_mean - (5)*interannual_sd ) %>%
+  filter(season_metric=='jas_ndwi') %>% 
+  ggplot(aes(interannual_mean,interannual_sd, fill=WetlandType))+
+  geom_point()+
+  facet_wrap(~WetlandType)
+
+p
+
+s2_spatmean %>% 
+  filter(PlotLayout %in% c('Spoke')) %>% 
+ left_join(
+    indicators %>% 
+      mutate(year = year(mdy_hms(FieldEvalDate))) %>% 
+      dplyr::select(
+        EvaluationID,year,CowardinAttribute,HGMClass, WetlandType,AdminState,LPI_SiteWetlandRating_CWM)
+    ) %>% 
+  pivot_longer(CowardinAttribute:LPI_SiteWetlandRating_CWM) %>% 
+  mutate(season_metric = paste0(season,'_',metric)) %>% 
+  ggplot(aes(value, interannual_sd))+geom_boxplot()+facet_grid(cols=vars(name),rows=vars(season_metric),scales='free')+
+  theme(axis.text.x = element_text(angle=90, vjust=0.5))
+```
+
+# regression
+
+```{r}
+dat_filt <- s2_spatmean %>% 
+  filter(PlotLayout %in% c('Spoke')) %>% 
+    dplyr::select(EvaluationID,year, season,metric,interannual_mean,interannual_sd ) %>% 
+ left_join(
+    indicators %>% 
+      mutate(year = year(mdy_hms(FieldEvalDate))) %>% 
+      dplyr::select(
+        EvaluationID,year,TotalFoliarCover,AH_BasalCover:BareOrganicMaterialCover,)
+    ) %>% 
+    left_join(
+      RW_FHMetrics_2022_2023 %>% 
+        dplyr::select(EvaluationID,FH_ShrubCover,FH_TreeCover,FH_PerennialCover,FH_AnnualCover,FH_WoodyCover,FH_NonwoodyCover) %>% 
+        mutate(FH_PFG = FH_PerennialCover-FH_WoodyCover, FH_allCover= FH_WoodyCover + FH_NonwoodyCover)
+    ) %>% 
+  pivot_wider(names_from = c(season, metric), values_from=c(interannual_mean,interannual_sd)) 
+
+mod <- dat_filt %>%
+  #filter(AdminState=='MT') %>%
+  lm(formula = AH_HydroFACCover ~ 
+     # Main effects
+     interannual_mean_amj_ndvi * interannual_mean_jas_ndvi +
+     interannual_mean_amj_ndwi * interannual_mean_jas_ndwi +
+     interannual_sd_amj_ndvi * interannual_sd_jas_ndvi +
+     interannual_sd_amj_ndwi * interannual_sd_jas_ndwi +
+     # Cross-interactions between means
+     interannual_mean_amj_ndvi * interannual_mean_amj_ndwi +
+     interannual_mean_jas_ndvi * interannual_mean_jas_ndwi +
+     # Cross-interactions between SDs
+     interannual_sd_amj_ndvi * interannual_sd_amj_ndwi +
+     interannual_sd_jas_ndvi * interannual_sd_jas_ndwi+ 
+    # Cross-interactions between ndvi means and SDs
+     interannual_mean_jas_ndvi * interannual_sd_jas_ndvi,
+     data = .)
+#  lm(data = .,FH_WoodyCover~interannual_mean_amj_ndvi+interannual_mean_jas_ndvi+interannual_sd_amj_ndvi +interannual_sd_jas_ndvi)
+
+summary(mod)
+plot(mod)
+
+# Calculate confidence intervals for the mean response
+conf_intervals <- predict(mod, interval = "confidence", level = 0.95)
+
+# Calculate prediction intervals for new observations
+pred_intervals <- predict(mod, interval = "prediction", level = 0.95)
+
+# Add these to your original data
+results <- dat_filt %>%
+  mutate(
+    # Confidence intervals
+    fit = conf_intervals[,"fit"],
+    conf_lwr = conf_intervals[,"lwr"],
+    conf_upr = conf_intervals[,"upr"],
+    # Prediction intervals
+    pred_lwr = pred_intervals[,"lwr"],
+    pred_upr = pred_intervals[,"upr"]
+  )
+
+# View the first few rows of results
+head(results)
+
+# To get a summary of the intervals
+summary_stats <- results %>%
+  summarise(
+    mean_conf_width = mean(conf_upr - conf_lwr),
+    mean_pred_width = mean(pred_upr - pred_lwr),
+    max_conf_width = max(conf_upr - conf_lwr),
+    max_pred_width = max(pred_upr - pred_lwr)
+  )
+
+print(summary_stats)
+```
+
+```{r}
+# Modified function to accept response variable
+generate_pred_data <- function(data, model, var_name, response_var) {
+  # Create prediction grid
+  pred_data <- data.frame(x = seq(min(data[[var_name]]), max(data[[var_name]]), length.out = 100))
+  names(pred_data) <- var_name
+  
+  # Add mean values for all other predictors
+  model_vars <- names(coef(model))[-1]  # exclude intercept
+  for(v in model_vars) {
+    if(!v %in% names(pred_data)) {
+      pred_data[[v]] <- mean(data[[v]], na.rm = TRUE)
+    }
+  }
+  
+  # Get predictions
+  preds <- predict(model, newdata = pred_data, interval = "confidence")
+  pred_int <- predict(model, newdata = pred_data, interval = "prediction")
+  
+  # Combine predictions
+  pred_data$fit <- preds[,"fit"]
+  pred_data$conf_lwr <- preds[,"lwr"]
+  pred_data$conf_upr <- preds[,"upr"]
+  pred_data$pred_lwr <- pred_int[,"lwr"]
+  pred_data$pred_upr <- pred_int[,"upr"]
+  
+  return(pred_data)
+}
+
+# Create plotting function with flexible response variable
+plot_predictions <- function(data, model, response_var) {
+  # Create plots for NDVI variables
+  ndvi_plots <- list()
+  ndvi_vars <- c("interannual_mean_amj_ndvi", "interannual_mean_jas_ndvi",
+                 "interannual_sd_amj_ndvi", "interannual_sd_jas_ndvi")
+
+  for(var in ndvi_vars) {
+    pred_data <- generate_pred_data(data, model, var, response_var)
+    
+    p <- ggplot() +
+      # Add actual data points
+      geom_point(data = data, aes_string(x = var, y = response_var), 
+                 alpha = 0.2, color = "gray50") +
+      # Add prediction interval
+      geom_ribbon(data = pred_data, 
+                  aes(x = .data[[var]], ymin = pred_lwr, ymax = pred_upr),
+                  fill = "lightblue", alpha = 0.2) +
+      # Add confidence interval
+      geom_ribbon(data = pred_data, 
+                  aes(x = .data[[var]], ymin = conf_lwr, ymax = conf_upr),
+                  fill = "blue", alpha = 0.2) +
+      # Add fitted line
+      geom_line(data = pred_data, 
+                aes(x = .data[[var]], y = fit),
+                color = "blue", size = 1) +
+      theme_bw() +
+      labs(y = gsub("_", " ", response_var),
+           x = gsub("_", " ", var),
+           title = paste("Relationship with", gsub("_", " ", var))) +
+      theme(plot.title = element_text(size = 10))
+    
+    ndvi_plots[[var]] <- p
+  }
+
+  # Create plots for NDWI variables
+  ndwi_plots <- list()
+  ndwi_vars <- c("interannual_mean_amj_ndwi", "interannual_mean_jas_ndwi",
+                 "interannual_sd_amj_ndwi", "interannual_sd_jas_ndwi")
+
+  for(var in ndwi_vars) {
+    pred_data <- generate_pred_data(data, model, var, response_var)
+    
+    p <- ggplot() +
+      geom_point(data = data, aes_string(x = var, y = response_var), 
+                 alpha = 0.2, color = "gray50") +
+      geom_ribbon(data = pred_data, 
+                  aes(x = .data[[var]], ymin = pred_lwr, ymax = pred_upr),
+                  fill = "lightgreen", alpha = 0.2) +
+      geom_ribbon(data = pred_data, 
+                  aes(x = .data[[var]], ymin = conf_lwr, ymax = conf_upr),
+                  fill = "green", alpha = 0.2) +
+      geom_line(data = pred_data, 
+                aes(x = .data[[var]], y = fit),
+                color = "darkgreen", size = 1) +
+      theme_bw() +
+      labs(y = gsub("_", " ", response_var),
+           x = gsub("_", " ", var),
+           title = paste("Relationship with", gsub("_", " ", var))) +
+      theme(plot.title = element_text(size = 10))
+    
+    ndwi_plots[[var]] <- p
+  }
+
+  # Combine all plots
+  grid.arrange(
+    grobs = c(ndvi_plots, ndwi_plots),
+    ncol = 4,
+    top = paste("Relationships between", gsub("_", " ", response_var), "and Predictors\n",
+                "(Blue/Green bands: Confidence intervals, Light blue/green bands: Prediction intervals)")
+  )
+}
+
+# Example usage:
+# For TotalFoliarCover
+plot_predictions(dat_filt, mod, "AH_HydroFACCover")
+
+# For a different response variable (assuming you've fit a model with a different response):
+# plot_predictions(dat_filt, different_model, "DifferentResponseVariable")
+```
+
+
