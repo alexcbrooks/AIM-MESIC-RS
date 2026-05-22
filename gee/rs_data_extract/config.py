@@ -27,8 +27,10 @@ POLYGONS_ASSET = 'projects/dri-apps/assets/blm-riparian/aim-rw-footprints-V3-NV_
 LOCAL_POINTS_PATH = "PATH_TO_LOCAL_POINTS_FILE"
 LOCAL_POLYGONS_PATH = "PATH_TO_LOCAL_POLYGONS_FILE"
 
-# ID column on input features (preserved into all outputs)
-ID_COLUMN = "EvltnID"
+# ID columns on input features (preserved into all outputs).
+# These can differ between the two feature classes.
+POINTS_ID_COLUMN = "EvltnID"
+POLYGONS_ID_COLUMN = "Evaluation"
 
 # -----------------------------------------------------------------------------
 # HUC layers (USGS Watershed Boundary Dataset, hosted in EE)
@@ -96,7 +98,7 @@ POINTS_HUC_COLUMN = "huc4"
 POLYGONS_HUC_COLUMN = "huc6"
 
 POINTS_MIN_BATCH = 20
-POINTS_MAX_BATCH = 300
+POINTS_MAX_BATCH = 400
 
 POLYGONS_MIN_BATCH = 10
 POLYGONS_MAX_BATCH = 100
@@ -104,10 +106,15 @@ POLYGONS_MAX_BATCH = 100
 # -----------------------------------------------------------------------------
 # Run flags (toggle in driver.py — these are defaults)
 # -----------------------------------------------------------------------------
-RUN_S2_INDICES = False       # Block 1: S2 NDVI, NDWI_NS, NDWI_GS bimonthly
+# Master feature-class switches. Setting one to False skips ALL blocks for
+# that feature class, regardless of BLOCK_FEATURE_TARGETS. A block targeting
+# "both" will run on whichever class is still enabled.
+RUN_POINTS = True
+RUN_POLYGONS = True
+
+RUN_S2_INDICES = True       # Block 1: S2 NDVI, NDWI_NS, NDWI_GS bimonthly
 RUN_S2_ALT_VIS = True       # Block 2: S2 EVI, MSAVI, MCARI2, FCVI, VSDI bimonthly
 RUN_S2_THRESHOLDS = True    # Block 3: NDVI proportion-above-threshold
-RUN_RAP_NDVI_SHORT = True   # Block 4: RAP NDVI short window (matches S2 years)
 RUN_LONG_TS = True          # Block 5: RAP NDVI + GRIDMET PR + SPEI long TS
 RUN_MRRMAID = True          # Block 6: MRRMAID class proportions
 
@@ -119,7 +126,6 @@ BLOCK_FEATURE_TARGETS = {
     "s2_indices":      "both",
     "s2_alt_vis":      "both",
     "s2_thresholds":   "polygons",  # threshold-proportion only meaningful for polygons
-    "rap_ndvi_short":  "both",
-    "long_ts":         "points",
+    "long_ts":         "both",      # RAP NDVI long TS + climate covariates for both
     "mrrmaid":         "polygons",  # MRRMAID is Nevada-only, polygon-based
 }

@@ -112,12 +112,12 @@ def build_batches(features, huc_col, min_size, max_size):
 # Export helper
 # =============================================================================
 
-def make_selectors(huc_col, data_columns, extra_leading=None):
+def make_selectors(id_col, huc_col, data_columns, extra_leading=None):
     """
     Build the export column order. Standard leading columns are:
-        EvltnID, huc_col, year, [extra_leading...], [data_columns...]
+        id_col, huc_col, year, [extra_leading...], [data_columns...]
     """
-    cols = [config.ID_COLUMN, huc_col, "year"]
+    cols = [id_col, huc_col, "year"]
     if extra_leading:
         cols += list(extra_leading)
     cols += list(data_columns)
@@ -213,12 +213,14 @@ def _s2_output_columns(run_indices, run_alt_vis, run_thresholds,
 
 def run_s2_extraction(features, feature_label, run_indices=True,
                       run_alt_vis=True, run_thresholds=False,
-                      huc_col=None, min_size=None, max_size=None,
+                      id_col=None, huc_col=None,
+                      min_size=None, max_size=None,
                       scale=None, batches=None):
     """
     Run Sentinel-2 extraction for blocks 1, 2, and 3 in one pass.
 
     feature_label : tag inserted into export descriptions ("points" / "polygons")
+    id_col        : property name carrying the unique feature ID
     """
     if not (run_indices or run_alt_vis or run_thresholds):
         print("no S2 sub-blocks enabled, skipping")
@@ -242,7 +244,17 @@ def run_s2_extraction(features, feature_label, run_indices=True,
         run_indices, run_alt_vis, run_thresholds,
         config.NDVI_THRESHOLDS, config.BIMONTHLY_WINDOWS,
     )
-    selectors = make_selectors(huc_col, data_cols)
+    selectors = make_selectors(id_col, huc_col, data_cols)
+
+    # Build a self-describing export name fragment from which sub-blocks ran
+    parts = []
+    if run_indices:
+        parts.append("idx")
+    if run_alt_vis:
+        parts.append("alt")
+    if run_thresholds:
+        parts.append("thr")
+    s2_tag = "_".join(parts)
 
     for batch_label, batch_fc in batches:
         # reduceRegions returns a FeatureCollection with all stacked bands as
@@ -250,7 +262,7 @@ def run_s2_extraction(features, feature_label, run_indices=True,
         def _reduce(img):
             year = ee.Number.parse(img.get("year"))
             stats = img.reduceRegions(
-                collection=batch_fc.select([config.ID_COLUMN, huc_col]),
+                collection=batch_fc.select([id_col, huc_col]),
                 reducer=ee.Reducer.mean(),
                 scale=scale,
             )
@@ -258,54 +270,7 @@ def run_s2_extraction(features, feature_label, run_indices=True,
 
         table = s2_annual.map(_reduce).flatten()
 
-        desc = f"s2_extract_{feature_label}_{batch_label}"
-        submit_export(table, desc, selectors=selectors)
-
-
-# =============================================================================
-# Block 4: Landsat RAP NDVI short window (matches S2 year range)
-# =============================================================================
-
-def run_rap_ndvi_short(features, feature_label,
-                      huc_col=None, min_size=None, max_size=None,
-                      batches=None):
-    """RAP NDVI bimonthly for the same year range as the S2 blocks."""
-    print(f"\n=== RAP NDVI short [{feature_label}] ===")
-
-    aoi = features.geometry()
-    rap = m.build_rap_ndvi_collection(
-        f"{config.S2_START_YEAR}-01-01",
-        f"{config.S2_END_YEAR}-12-31",
-        aoi,
-    ).select(["NDVI"], ["ndvi"])
-
-    years = ee.List.sequence(config.S2_START_YEAR, config.S2_END_YEAR)
-
-    def _per_year(year):
-        return m.stack_bimonthly_year(rap, year, ["ndvi"]).set(
-            "year", ee.Number(year).format("%.0f")
-        )
-
-    rap_annual = ee.ImageCollection(years.map(_per_year))
-
-    if batches is None:
-        batches = build_batches(features, huc_col, min_size, max_size)
-
-    data_cols = [f"{label}_ndvi" for (label, _, _) in config.BIMONTHLY_WINDOWS]
-    selectors = make_selectors(huc_col, data_cols)
-
-    for batch_label, batch_fc in batches:
-        def _reduce(img):
-            year = ee.Number.parse(img.get("year"))
-            stats = img.reduceRegions(
-                collection=batch_fc.select([config.ID_COLUMN, huc_col]),
-                reducer=ee.Reducer.mean(),
-                scale=config.RAP_SCALE,
-            )
-            return stats.map(lambda f: f.set("year", year))
-
-        table = rap_annual.map(_reduce).flatten()
-        desc = f"rap_ndvi_short_{feature_label}_{batch_label}"
+        desc = f"s2_{s2_tag}_{feature_label}_{batch_label}"
         submit_export(table, desc, selectors=selectors)
 
 
@@ -314,12 +279,13 @@ def run_rap_ndvi_short(features, feature_label,
 # =============================================================================
 
 def run_long_ts(features, feature_label,
-                huc_col=None, min_size=None, max_size=None,
+                id_col=None, huc_col=None,
+                min_size=None, max_size=None,
                 batches=None):
     """
     Long time series for RAP NDVI (bimonthly), GRIDMET water-year PR, and
     SPEI1y end-of-water-year, exported as separate tables (different temporal
-    domains, all keyed on EvltnID + year).
+    domains, all keyed on id_col + year).
     """
     print(f"\n=== Long TS [{feature_label}] ===")
 
@@ -359,16 +325,16 @@ def run_long_ts(features, feature_label,
         batches = build_batches(features, huc_col, min_size, max_size)
 
     rap_cols = [f"{label}_ndvi" for (label, _, _) in config.BIMONTHLY_WINDOWS]
-    rap_selectors = make_selectors(huc_col, rap_cols)
-    pr_selectors = make_selectors(huc_col, ["pr_wy_sum"])
-    spei_selectors = make_selectors(huc_col, ["spei1y_eow"])
+    rap_selectors = make_selectors(id_col, huc_col, rap_cols)
+    pr_selectors = make_selectors(id_col, huc_col, ["pr_wy_sum"])
+    spei_selectors = make_selectors(id_col, huc_col, ["spei1y_eow"])
 
     for batch_label, batch_fc in batches:
         # RAP
         def _reduce_rap(img):
             year = ee.Number.parse(img.get("year"))
             return img.reduceRegions(
-                collection=batch_fc.select([config.ID_COLUMN, huc_col]),
+                collection=batch_fc.select([id_col, huc_col]),
                 reducer=ee.Reducer.mean(),
                 scale=config.RAP_SCALE,
             ).map(lambda f: f.set("year", year))
@@ -381,7 +347,7 @@ def run_long_ts(features, feature_label,
         def _reduce_pr(img):
             year = ee.Number.parse(img.get("year"))
             return img.reduceRegions(
-                collection=batch_fc.select([config.ID_COLUMN, huc_col]),
+                collection=batch_fc.select([id_col, huc_col]),
                 reducer=ee.Reducer.mean(),
                 scale=config.GRIDMET_SCALE,
             ).map(lambda f: f.set("year", year))
@@ -394,7 +360,7 @@ def run_long_ts(features, feature_label,
         def _reduce_spei(img):
             year = ee.Number.parse(img.get("year"))
             return img.reduceRegions(
-                collection=batch_fc.select([config.ID_COLUMN, huc_col]),
+                collection=batch_fc.select([id_col, huc_col]),
                 reducer=ee.Reducer.mean(),
                 scale=config.GRIDMET_SCALE,
             ).map(lambda f: f.set("year", year))
@@ -409,7 +375,8 @@ def run_long_ts(features, feature_label,
 # =============================================================================
 
 def run_mrrmaid(features, feature_label,
-                huc_col=None, min_size=None, max_size=None,
+                id_col=None, huc_col=None,
+                min_size=None, max_size=None,
                 batches=None):
     """
     MRRMAID class proportions. Preserves per-image temporal granularity
@@ -430,7 +397,7 @@ def run_mrrmaid(features, feature_label,
         batches = build_batches(features, huc_col, min_size, max_size)
 
     for batch_label, batch_fc in batches:
-        select_fc = batch_fc.select([config.ID_COLUMN, huc_col])
+        select_fc = batch_fc.select([id_col, huc_col])
 
         def _proportions_per_image(img):
             year = img.get("year")
@@ -464,8 +431,9 @@ def run_mrrmaid(features, feature_label,
             return stats.map(_flatten)
 
         table = mrr.map(_proportions_per_image).flatten()
-        # Standard column order: EvltnID, huc_col, year, month, prop_class_1..5
+        # Standard column order: id_col, huc_col, year, month, prop_class_1..5
         data_cols = [f"prop_class_{c}" for c in m.MRRMAID_CLASSES]
-        selectors = make_selectors(huc_col, data_cols, extra_leading=["month"])
+        selectors = make_selectors(id_col, huc_col, data_cols,
+                                   extra_leading=["month"])
         submit_export(table, f"mrrmaid_{feature_label}_{batch_label}",
                       selectors=selectors)
